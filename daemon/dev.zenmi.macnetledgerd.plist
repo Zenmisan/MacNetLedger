@@ -1,0 +1,34 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>dev.zenmi.macnetledgerd</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/usr/local/bin/macnetledgerd</string>
+        <string>--db</string>
+        <string>/Library/Application Support/MacNetLedger/ledger.db</string>
+    </array>
+
+    <!-- Automatically start on boot and system wake -->
+    <key>RunAtLoad</key>
+    <true/>
+
+    <!-- Keep running indefinitely; restart if killed or network drops -->
+    <key>KeepAlive</key>
+    <true/>
+
+    <!-- Low priority background process to protect battery & CPU -->
+    <key>ProcessType</key>
+    <string>Background</string>
+    <key>LowPriorityIO</key>
+    <true/>
+
+    <key>StandardOutPath</key>
+    <string>/var/log/macnetledgerd.log</string>
+    <key>StandardErrorPath</key>
+    <string>/var/log/macnetledgerd.error.log</string>
+</dict>
+</plist>
