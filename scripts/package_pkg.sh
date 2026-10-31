@@ -54,6 +54,10 @@ chmod 0777 "/Library/Application Support/MacNetLedger"
 launchctl unload /Library/LaunchDaemons/dev.zenmi.macnetledgerd.plist 2>/dev/null || true
 launchctl load -w /Library/LaunchDaemons/dev.zenmi.macnetledgerd.plist
 
+# Terminate any old running instance so the newly updated binary starts
+killall MacNetLedger 2>/dev/null || true
+sleep 1
+
 # Launch the menu bar app for the currently logged in GUI user
 CURRENT_USER=$(stat -f "%Su" /dev/console)
 if [ -n "$CURRENT_USER" ] && [ "$CURRENT_USER" != "root" ]; then
@@ -71,7 +75,7 @@ if command -v pkgbuild &>/dev/null; then
         --root "${PKG_ROOT}" \
         --scripts "${SCRIPTS_DIR}" \
         --identifier "dev.zenmi.MacNetLedger" \
-        --version "1.0.0" \
+        --version "1.0.2" \
         --install-location "/" \
         "${OUTPUT_PKG}"
     echo "[3/3] Package generated successfully:"

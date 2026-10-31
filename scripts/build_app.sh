@@ -34,14 +34,23 @@ cat << 'EOF' > "${APP_BUNDLE}/Contents/Info.plist"
     <key>CFBundlePackageType</key>
     <string>APPL</string>
     <key>CFBundleShortVersionString</key>
-    <string>1.0.0</string>
+    <string>1.0.2</string>
     <key>LSMinimumSystemVersion</key>
     <string>12.0</string>
+    <key>NSPrincipalClass</key>
+    <string>NSApplication</string>
     <key>LSUIElement</key>
-    <true/>
+    <false/>
 </dict>
 </plist>
 EOF
+
+SWIFT_SOURCES=(
+    "${APP_DIR}/LedgerReader.swift"
+    "${APP_DIR}/Views/FlyoutPanel.swift"
+    "${APP_DIR}/AppDelegate.swift"
+    "${APP_DIR}/main.swift"
+)
 
 if command -v swiftc &>/dev/null; then
     SDK_FLAG=()
@@ -59,9 +68,7 @@ if command -v swiftc &>/dev/null; then
         -framework Cocoa \
         -framework SwiftUI \
         -lsqlite3 \
-        "${APP_DIR}/LedgerReader.swift" \
-        "${APP_DIR}/Views/FlyoutPanel.swift" \
-        "${APP_DIR}/AppDelegate.swift" \
+        "${SWIFT_SOURCES[@]}" \
         -o "${BUILD_DIR}/bin/MacNetLedger-x86_64" || true
 
     # Build Apple Silicon arm64
@@ -71,9 +78,7 @@ if command -v swiftc &>/dev/null; then
         -framework Cocoa \
         -framework SwiftUI \
         -lsqlite3 \
-        "${APP_DIR}/LedgerReader.swift" \
-        "${APP_DIR}/Views/FlyoutPanel.swift" \
-        "${APP_DIR}/AppDelegate.swift" \
+        "${SWIFT_SOURCES[@]}" \
         -o "${BUILD_DIR}/bin/MacNetLedger-arm64" || true
 
     # Create Universal Binary if both exist
@@ -92,9 +97,7 @@ if command -v swiftc &>/dev/null; then
             -framework Cocoa \
             -framework SwiftUI \
             -lsqlite3 \
-            "${APP_DIR}/LedgerReader.swift" \
-            "${APP_DIR}/Views/FlyoutPanel.swift" \
-            "${APP_DIR}/AppDelegate.swift" \
+            "${SWIFT_SOURCES[@]}" \
             -o "${APP_BUNDLE}/Contents/MacOS/MacNetLedger"
     fi
 

@@ -1,21 +1,16 @@
 import Cocoa
 import SwiftUI
 
-@main
-class AppDelegate: NSObject, NSApplicationDelegate {
-    private var statusItem: NSStatusItem!
-    private var popover: NSPopover!
-    private var fallbackWindow: NSWindow?
+class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
+    public var statusItem: NSStatusItem!
+    public var popover: NSPopover!
+    public var mainWindow: NSWindow?
     private var timer: Timer?
     private let reader = LedgerReader()
 
     func applicationDidFinishLaunching(_ notification: Notification) {
-        // Ensure accessory activation policy
-        NSApp.setActivationPolicy(.accessory)
-
-        // Create NSStatusItem in the macOS menu bar
+        // 1. Create NSStatusItem in the macOS menu bar
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
-        statusItem.autosaveName = "dev.zenmi.MacNetLedger.StatusItem"
 
         if let button = statusItem.button {
             if let icon = NSImage(systemSymbolName: "network", accessibilityDescription: "MacNetLedger") {
@@ -24,61 +19,52 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                 button.imagePosition = .imageLeading
             }
             button.title = " 0 B/s"
-            button.action = #selector(togglePopover)
+            button.action = #selector(togglePopoverOrWindow)
             button.target = self
             button.sendAction(on: [.leftMouseUp, .rightMouseUp])
         }
 
-        // Initialize NSPopover with SwiftUI FlyoutPanelView
+        // 2. Initialize NSPopover with SwiftUI FlyoutPanelView
         popover = NSPopover()
         popover.contentSize = NSSize(width: 540, height: 640)
         popover.behavior = .transient
         popover.contentViewController = NSHostingController(rootView: FlyoutPanelView(reader: reader))
 
-        // Initial pill update
-        updateMenuBarPill()
+        // 3. Immediately show the main window on first launch so user sees the interface
+        showMainWindow()
 
-        // Start 2-second UI poll timer
+        // 4. Update menu bar pill and start 2-second UI poll timer
+        updateMenuBarPill()
         timer = Timer.scheduledTimer(withTimeInterval: 2.0, repeats: true) { [weak self] _ in
             self?.updateMenuBarPill()
         }
     }
 
     func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
-        togglePopover()
+        showMainWindow()
         return true
     }
 
-    private func updateMenuBarPill() {
-        guard let button = statusItem.button else { return }
-
-        if let summary = reader.fetchLiveSummary() {
-            let downStr = formatRate(summary.rxRate)
-            let upStr = formatRate(summary.txRate)
-
-            if (summary.rxRate + summary.txRate) > 102400 && !summary.topProcess.isEmpty {
-                // High throughput hog badge
-                button.title = " ↓ \(downStr) · \(summary.topProcess)"
-            } else {
-                button.title = " ↓ \(downStr) ↑ \(upStr)"
-            }
-        } else {
-            // Waiting for daemon connection
-            button.title = " ..."
+    @objc public func showMainWindow() {
+        if mainWindow == nil {
+            let win = NSWindow(
+                contentRect: NSRect(x: 0, y: 0, width: 540, height: 640),
+                styleMask: [.titled, .closable, .miniaturizable],
+                backing: .buffered,
+                defer: false
+            )
+            win.title = "MacNetLedger"
+            win.isReleasedWhenClosed = false
+            win.delegate = self
+            win.center()
+            win.contentView = NSHostingView(rootView: FlyoutPanelView(reader: reader))
+            mainWindow = win
         }
+        mainWindow?.makeKeyAndOrderFront(nil)
+        NSApp.activate(ignoringOtherApps: true)
     }
 
-    private func formatRate(_ bytesPerSec: Double) -> String {
-        if bytesPerSec >= 1048576 {
-            return String(format: "%.1fM", bytesPerSec / 1048576)
-        } else if bytesPerSec >= 1024 {
-            return String(format: "%.0fK", bytesPerSec / 1024)
-        } else {
-            return String(format: "%.0fB", bytesPerSec)
-        }
-    }
-
-    @objc private func togglePopover() {
+    @objc private func togglePopoverOrWindow() {
         let currentEvent = NSApp.currentEvent
         if currentEvent?.type == .rightMouseUp {
             showContextMenu()
@@ -93,40 +79,50 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                 popover.contentViewController?.view.window?.makeKey()
             }
         } else {
-            // Fallback: If statusItem is not visible or clipped from menu bar, open standalone window
-            toggleFallbackWindow()
+            showMainWindow()
         }
     }
 
     private func showContextMenu() {
         let menu = NSMenu()
-        menu.addItem(NSMenuItem(title: "Open MacNetLedger", action: #selector(toggleFallbackWindow), keyEquivalent: "o"))
+        menu.addItem(NSMenuItem(title: "Open Window", action: #selector(showMainWindow), keyEquivalent: "o"))
         menu.addItem(NSMenuItem.separator())
-        menu.addItem(NSMenuItem(title: "Quit", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q"))
+        menu.addItem(NSMenuItem(title: "Quit MacNetLedger", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q"))
         statusItem.menu = menu
         statusItem.button?.performClick(nil)
-        statusItem.menu = nil // Restore toggle behavior after click
+        statusItem.menu = nil
     }
 
-    @objc private func toggleFallbackWindow() {
-        if let win = fallbackWindow, win.isVisible {
-            win.orderOut(nil)
-            return
+    private func updateMenuBarPill() {
+        guard let button = statusItem.button else { return }
+
+        if let summary = reader.fetchLiveSummary() {
+            let downStr = formatRate(summary.rxRate)
+            let upStr = formatRate(summary.txRate)
+
+            if (summary.rxRate + summary.txRate) > 102400 && !summary.topProcess.isEmpty {
+                button.title = " ↓ \(downStr) · \(summary.topProcess)"
+            } else {
+                button.title = " ↓ \(downStr) ↑ \(upStr)"
+            }
+        } else {
+            button.title = " ..."
         }
-        if fallbackWindow == nil {
-            let win = NSWindow(
-                contentRect: NSRect(x: 0, y: 0, width: 540, height: 640),
-                styleMask: [.titled, .closable, .miniaturizable],
-                backing: .buffered,
-                defer: false
-            )
-            win.title = "MacNetLedger"
-            win.isReleasedWhenClosed = false
-            win.center()
-            win.contentView = NSHostingView(rootView: FlyoutPanelView(reader: reader))
-            fallbackWindow = win
+    }
+
+    private func formatRate(_ bytesPerSec: Double) -> String {
+        if bytesPerSec >= 1048576 {
+            return String(format: "%.1fM", bytesPerSec / 1048576)
+        } else if bytesPerSec >= 1024 {
+            return String(format: "%.0fK", bytesPerSec / 1024)
+        } else {
+            return String(format: "%.0fB", bytesPerSec)
         }
-        fallbackWindow?.makeKeyAndOrderFront(nil)
-        NSApp.activate(ignoringOtherApps: true)
+    }
+
+    func windowShouldClose(_ sender: NSWindow) -> Bool {
+        // Hide window on close instead of destroying it
+        sender.orderOut(nil)
+        return false
     }
 }

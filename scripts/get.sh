@@ -36,7 +36,9 @@ echo "Installing MacNetLedger into /Applications..."
 cp -r build/MacNetLedger.app /Applications/
 
 # Launch app
-echo "Launching MacNetLedger in the macOS Menu Bar..."
+echo "Launching MacNetLedger..."
+killall MacNetLedger 2>/dev/null || true
+sleep 1
 open /Applications/MacNetLedger.app
 
 echo "=========================================================="
