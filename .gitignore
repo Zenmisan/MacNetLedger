@@ -1,0 +1,21 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Build and app bundle artifacts
+build/
+*.app/
+*.dSYM/
+.build/
+
+# macOS system files
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# Database and log artifacts
+*.db
+*.db-wal
+*.db-shm
+*.log
