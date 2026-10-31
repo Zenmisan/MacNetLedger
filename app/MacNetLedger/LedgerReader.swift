@@ -46,7 +46,7 @@ public class LedgerReader {
 
     public init(dbPath: String = "/Library/Application Support/MacNetLedger/ledger.db") {
         self.dbPath = dbPath
-        openDatabase()
+        _ = ensureDatabaseOpen()
     }
 
     deinit {
@@ -55,19 +55,22 @@ public class LedgerReader {
         }
     }
 
-    private func openDatabase() {
+    @discardableResult
+    private func ensureDatabaseOpen() -> Bool {
+        if db != nil { return true }
         let flags = SQLITE_OPEN_READONLY | SQLITE_OPEN_FULLMUTEX
         if sqlite3_open_v2(dbPath, &db, flags, nil) == SQLITE_OK {
-            // Enforce query_only pragma to prevent any lock contention
             var statement: OpaquePointer?
             sqlite3_prepare_v2(db, "PRAGMA query_only = ON;", -1, &statement, nil)
             sqlite3_step(statement)
             sqlite3_finalize(statement)
+            return true
         }
+        return false
     }
 
     public func fetchLiveSummary() -> LiveSummary? {
-        guard let db = db else { return nil }
+        guard ensureDatabaseOpen(), let db = db else { return nil }
         let sql = """
             SELECT rx_rate, tx_rate, top_process, top_category, network_name, is_hotspot, hotspot_today_bytes
             FROM live_summary WHERE id = 1;
@@ -99,7 +102,7 @@ public class LedgerReader {
     }
 
     public func fetchProcessGroups(startTs: Int64, endTs: Int64, hotspotOnly: Bool = false) -> [ProcessGroupItem] {
-        guard let db = db else { return [] }
+        guard ensureDatabaseOpen(), let db = db else { return [] }
         let table = (endTs - startTs) > (48 * 3600) ? "rollup_1hour" : "rollup_5min"
         var sql = """
             SELECT root_group, category, child_comm, child_detail, SUM(rx_bytes), SUM(tx_bytes)

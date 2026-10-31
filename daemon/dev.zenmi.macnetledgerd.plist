@@ -5,11 +5,17 @@
     <key>Label</key>
     <string>dev.zenmi.macnetledgerd</string>
 
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:/opt/homebrew/bin</string>
+    </dict>
+
     <key>ProgramArguments</key>
     <array>
-        <string>/usr/local/bin/macnetledgerd</string>
-        <string>--db</string>
-        <string>/Library/Application Support/MacNetLedger/ledger.db</string>
+        <string>/bin/sh</string>
+        <string>-c</string>
+        <string>PYTHON=$(command -v python3 || echo /usr/bin/python3); exec "$PYTHON" /usr/local/bin/macnetledgerd --db "/Library/Application Support/MacNetLedger/ledger.db"</string>
     </array>
 
     <!-- Automatically start on boot and system wake -->
