@@ -19,3 +19,6 @@ build/
 *.db-wal
 *.db-shm
 *.log
+
+# Agents tracking folder
+.agents/
