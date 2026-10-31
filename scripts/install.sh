@@ -21,11 +21,12 @@ APP_SUPPORT_DIR="/Library/Application Support/MacNetLedger"
 DAEMON_SRC="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/daemon"
 BIN_TARGET="/usr/local/bin/macnetledgerd"
 PLIST_TARGET="/Library/LaunchDaemons/dev.zenmi.macnetledgerd.plist"
+AGENT_TARGET="/Library/LaunchAgents/dev.zenmi.MacNetLedger.gui.plist"
 
 # 1. Create Application Support Directory
 echo "[1/4] Provisioning storage directory: ${APP_SUPPORT_DIR}"
 mkdir -p "${APP_SUPPORT_DIR}"
-chmod 0777 "${APP_SUPPORT_DIR}"
+chmod -R 0777 "${APP_SUPPORT_DIR}"
 
 # 2. Install Daemon Binary
 echo "[2/4] Installing daemon executable: ${BIN_TARGET}"
@@ -34,9 +35,8 @@ cp "${DAEMON_SRC}/macnetledgerd.py" "${BIN_TARGET}"
 chmod 0755 "${BIN_TARGET}"
 chown root:wheel "${BIN_TARGET}"
 
-# 3. Install Launchd Plist Descriptor
-echo "[3/4] Installing launchd service descriptor: ${PLIST_TARGET}"
-# Unload previous instance if active
+# 3. Install Launchd Plist Descriptors (Daemon + Agent)
+echo "[3/4] Installing launchd service descriptors..."
 if launchctl list | grep -q "dev.zenmi.macnetledgerd"; then
     echo "Unloading existing daemon instance..."
     launchctl unload "${PLIST_TARGET}" 2>/dev/null || true
@@ -46,9 +46,16 @@ cp "${DAEMON_SRC}/dev.zenmi.macnetledgerd.plist" "${PLIST_TARGET}"
 chown root:wheel "${PLIST_TARGET}"
 chmod 0644 "${PLIST_TARGET}"
 
+mkdir -p /Library/LaunchAgents
+cp "${DAEMON_SRC}/dev.zenmi.MacNetLedger.gui.plist" "${AGENT_TARGET}"
+chown root:wheel "${AGENT_TARGET}"
+chmod 0644 "${AGENT_TARGET}"
+
 # 4. Load and Start Launchd Daemon
 echo "[4/4] Activating and starting MacNetLedger daemon..."
 launchctl load -w "${PLIST_TARGET}"
+sleep 1
+chmod -R 0777 "${APP_SUPPORT_DIR}"
 
 echo "=========================================================="
 echo " ✓ MacNetLedger installation completed successfully!      "

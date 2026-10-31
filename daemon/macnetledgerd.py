@@ -450,6 +450,11 @@ class MacLedgerStorage:
         self._ensure_file_permissions()
 
     def _ensure_file_permissions(self):
+        try:
+            if self.db_path.parent.exists():
+                os.chmod(self.db_path.parent, 0o777)
+        except Exception:
+            pass
         for p in [self.db_path, self.db_path.with_name(self.db_path.name + "-wal"), self.db_path.with_name(self.db_path.name + "-shm")]:
             try:
                 if p.exists():
@@ -652,6 +657,11 @@ class NetTopSnapshotCollector:
 
 
 def main():
+    try:
+        os.umask(0)
+    except Exception:
+        pass
+
     parser = argparse.ArgumentParser(description="MacNetLedger Background Telemetry Daemon")
     parser.add_argument("--db", default=DEFAULT_DB_PATH, help="Path to SQLite ledger database")
     parser.add_argument("--interval", type=int, default=2, help="Sampling interval in seconds (default: 2)")

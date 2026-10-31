@@ -28,7 +28,9 @@ rm -rf "${PKG_ROOT}" "${SCRIPTS_DIR}" "${OUTPUT_PKG}"
 mkdir -p "${PKG_ROOT}/Applications"
 mkdir -p "${PKG_ROOT}/usr/local/bin"
 mkdir -p "${PKG_ROOT}/Library/LaunchDaemons"
+mkdir -p "${PKG_ROOT}/Library/LaunchAgents"
 mkdir -p "${PKG_ROOT}/Library/Application Support/MacNetLedger"
+chmod 0777 "${PKG_ROOT}/Library/Application Support/MacNetLedger"
 mkdir -p "${SCRIPTS_DIR}"
 
 # 2. Stage files into root
@@ -37,22 +39,31 @@ cp -r "${BUILD_DIR}/MacNetLedger.app" "${PKG_ROOT}/Applications/"
 cp "${ROOT_DIR}/daemon/macnetledgerd.py" "${PKG_ROOT}/usr/local/bin/macnetledgerd"
 chmod +x "${PKG_ROOT}/usr/local/bin/macnetledgerd"
 cp "${ROOT_DIR}/daemon/dev.zenmi.macnetledgerd.plist" "${PKG_ROOT}/Library/LaunchDaemons/"
+cp "${ROOT_DIR}/daemon/dev.zenmi.MacNetLedger.gui.plist" "${PKG_ROOT}/Library/LaunchAgents/"
 
 # 3. Create postinstall script for pkgbuild
 cat << 'EOF' > "${SCRIPTS_DIR}/postinstall"
 #!/bin/bash
 set -e
 
-# Fix permissions
+# Fix daemon and agent descriptors
 chmod 0755 /usr/local/bin/macnetledgerd
 chown root:wheel /usr/local/bin/macnetledgerd
 chmod 0644 /Library/LaunchDaemons/dev.zenmi.macnetledgerd.plist
 chown root:wheel /Library/LaunchDaemons/dev.zenmi.macnetledgerd.plist
-chmod 0777 "/Library/Application Support/MacNetLedger"
+chmod 0644 /Library/LaunchAgents/dev.zenmi.MacNetLedger.gui.plist 2>/dev/null || true
+
+# Guarantee 0777 full permissions on the storage folder
+mkdir -p "/Library/Application Support/MacNetLedger"
+chmod -R 0777 "/Library/Application Support/MacNetLedger"
 
 # Register and start launchd daemon
 launchctl unload /Library/LaunchDaemons/dev.zenmi.macnetledgerd.plist 2>/dev/null || true
 launchctl load -w /Library/LaunchDaemons/dev.zenmi.macnetledgerd.plist
+
+# Give the daemon 1 second to create/verify initial SQLite tables and re-apply full permissions
+sleep 1
+chmod -R 0777 "/Library/Application Support/MacNetLedger" 2>/dev/null || true
 
 # Terminate any old running instance so the newly updated binary starts
 killall MacNetLedger 2>/dev/null || true
@@ -75,7 +86,7 @@ if command -v pkgbuild &>/dev/null; then
         --root "${PKG_ROOT}" \
         --scripts "${SCRIPTS_DIR}" \
         --identifier "dev.zenmi.MacNetLedger" \
-        --version "1.0.4" \
+        --version "1.0.5" \
         --install-location "/" \
         "${OUTPUT_PKG}"
     echo "[3/3] Package generated successfully:"
