@@ -9,7 +9,7 @@ public struct FlyoutPanelView: View {
     @State private var processGroups: [ProcessGroupItem] = []
     @State private var liveSummary: LiveSummary? = nil
 
-    private let updateTimer = Timer.publish(every: 2.0, on: .main, in: .common).autoconnect()
+    private let updateTimer = Timer.publish(every: 1.0, on: .main, in: .common).autoconnect()
     private let cyanColor = Color(red: 0.13, green: 0.83, blue: 0.93) // #22d3ee
     private let amberColor = Color(red: 0.96, green: 0.62, blue: 0.04) // #f59e0b
     private let bgColor = Color(red: 0.07, green: 0.09, blue: 0.11) // #12161C

@@ -662,7 +662,7 @@ def main():
 
     parser = argparse.ArgumentParser(description="MacNetLedger Background Telemetry Daemon")
     parser.add_argument("--db", default=DEFAULT_DB_PATH, help="Path to SQLite ledger database")
-    parser.add_argument("--interval", type=int, default=2, help="Sampling interval in seconds (default: 2)")
+    parser.add_argument("--interval", type=int, default=1, help="Sampling interval in seconds (default: 1)")
     parser.add_argument("--log-level", default="INFO", choices=["DEBUG", "INFO", "WARNING", "ERROR"])
     args = parser.parse_args()
 

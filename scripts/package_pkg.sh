@@ -86,7 +86,7 @@ if command -v pkgbuild &>/dev/null; then
         --root "${PKG_ROOT}" \
         --scripts "${SCRIPTS_DIR}" \
         --identifier "dev.zenmi.MacNetLedger" \
-        --version "1.0.6" \
+        --version "1.0.7" \
         --install-location "/" \
         "${OUTPUT_PKG}"
     echo "[3/3] Package generated successfully:"

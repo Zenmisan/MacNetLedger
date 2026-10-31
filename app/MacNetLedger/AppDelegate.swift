@@ -33,9 +33,9 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         // 3. Immediately show the main window on first launch so user sees the interface
         showMainWindow()
 
-        // 4. Update menu bar pill and start 2-second UI poll timer
+        // 4. Update menu bar pill and start 1-second UI poll timer
         updateMenuBarPill()
-        timer = Timer.scheduledTimer(withTimeInterval: 2.0, repeats: true) { [weak self] _ in
+        timer = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { [weak self] _ in
             self?.updateMenuBarPill()
         }
     }
