@@ -3,12 +3,13 @@ import SwiftUI
 public struct FlyoutPanelView: View {
     public let reader: LedgerReader
 
-    @State private var selectedRange: String = "24H"
+    @State private var selectedRange: String = "LIVE"
     @State private var filterHotspotOnly: Bool = false
     @State private var expandedGroups: Set<String> = []
     @State private var processGroups: [ProcessGroupItem] = []
     @State private var liveSummary: LiveSummary? = nil
 
+    private let updateTimer = Timer.publish(every: 2.0, on: .main, in: .common).autoconnect()
     private let cyanColor = Color(red: 0.13, green: 0.83, blue: 0.93) // #22d3ee
     private let amberColor = Color(red: 0.96, green: 0.62, blue: 0.04) // #f59e0b
     private let bgColor = Color(red: 0.07, green: 0.09, blue: 0.11) // #12161C
@@ -92,10 +93,12 @@ public struct FlyoutPanelView: View {
 
             HStack {
                 VStack(alignment: .leading, spacing: 2) {
-                    Text("WINDOW TOTAL")
+                    Text(selectedRange == "LIVE" ? "ACTIVE RATE" : "WINDOW TOTAL")
                         .font(.system(size: 9, weight: .semibold))
                         .foregroundColor(.gray)
-                    Text(formatBytes(totalBytes))
+                    Text(selectedRange == "LIVE" && liveSummary != nil ?
+                         formatRate((liveSummary?.rxRate ?? 0) + (liveSummary?.txRate ?? 0)) :
+                         formatBytes(totalBytes))
                         .font(.system(size: 16, weight: .bold, design: .monospaced))
                         .foregroundColor(.white)
                 }
@@ -107,7 +110,9 @@ public struct FlyoutPanelView: View {
                         Text("⤓ DOWNLOAD")
                             .font(.system(size: 9, weight: .semibold))
                             .foregroundColor(cyanColor)
-                        Text(formatBytes(totalRx))
+                        Text(selectedRange == "LIVE" && liveSummary != nil ?
+                             formatRate(liveSummary?.rxRate ?? 0) :
+                             formatBytes(totalRx))
                             .font(.system(size: 12, weight: .bold, design: .monospaced))
                             .foregroundColor(.white)
                     }
@@ -116,7 +121,9 @@ public struct FlyoutPanelView: View {
                         Text("⤒ UPLOAD")
                             .font(.system(size: 9, weight: .semibold))
                             .foregroundColor(amberColor)
-                        Text(formatBytes(totalTx))
+                        Text(selectedRange == "LIVE" && liveSummary != nil ?
+                             formatRate(liveSummary?.txRate ?? 0) :
+                             formatBytes(totalTx))
                             .font(.system(size: 12, weight: .bold, design: .monospaced))
                             .foregroundColor(.white)
                     }
@@ -127,87 +134,104 @@ public struct FlyoutPanelView: View {
             .cornerRadius(8)
             .padding(.horizontal, 16)
 
-            // Process Lineage Table
-            let maxTotal = Double(processGroups.first?.totalBytes ?? 1)
-            ScrollView {
-                VStack(spacing: 6) {
-                    ForEach(processGroups) { group in
-                        VStack(spacing: 4) {
-                            // Top Parent Row
-                            HStack {
-                                Button(action: {
-                                    if expandedGroups.contains(group.rootGroup) {
-                                        expandedGroups.remove(group.rootGroup)
-                                    } else {
-                                        expandedGroups.insert(group.rootGroup)
-                                    }
-                                }) {
-                                    HStack(spacing: 6) {
-                                        Image(systemName: expandedGroups.contains(group.rootGroup) ? "chevron.down" : "chevron.right")
-                                            .font(.system(size: 9))
-                                            .foregroundColor(.gray)
+            // Process Lineage Table or Empty State
+            if processGroups.isEmpty {
+                VStack(spacing: 12) {
+                    Spacer()
+                    Image(systemName: "waveform.path.ecg")
+                        .font(.system(size: 32))
+                        .foregroundColor(.gray.opacity(0.5))
+                    Text("Recording network activity...")
+                        .font(.system(size: 13, weight: .medium))
+                        .foregroundColor(.gray)
+                    Text("Traffic will appear here as applications transfer data.")
+                        .font(.system(size: 11))
+                        .foregroundColor(.gray.opacity(0.7))
+                    Spacer()
+                }
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+            } else {
+                let maxTotal = Double(processGroups.first?.totalBytes ?? 1)
+                ScrollView {
+                    VStack(spacing: 6) {
+                        ForEach(processGroups) { group in
+                            VStack(spacing: 4) {
+                                // Top Parent Row
+                                HStack {
+                                    Button(action: {
+                                        if expandedGroups.contains(group.rootGroup) {
+                                            expandedGroups.remove(group.rootGroup)
+                                        } else {
+                                            expandedGroups.insert(group.rootGroup)
+                                        }
+                                    }) {
+                                        HStack(spacing: 6) {
+                                            Image(systemName: expandedGroups.contains(group.rootGroup) ? "chevron.down" : "chevron.right")
+                                                .font(.system(size: 9))
+                                                .foregroundColor(.gray)
 
-                                        Text(group.rootGroup)
-                                            .font(.system(size: 12, weight: .medium))
-                                            .foregroundColor(.white)
-                                            .lineLimit(1)
+                                            Text(group.rootGroup)
+                                                .font(.system(size: 12, weight: .medium))
+                                                .foregroundColor(.white)
+                                                .lineLimit(1)
+                                        }
                                     }
+                                    .buttonStyle(PlainButtonStyle())
+
+                                    Spacer()
+
+                                    Text(selectedRange == "LIVE" ? formatRate(Double(group.totalBytes)) : formatBytes(group.totalBytes))
+                                        .font(.system(size: 11, weight: .semibold, design: .monospaced))
+                                        .foregroundColor(.white)
                                 }
-                                .buttonStyle(PlainButtonStyle())
 
-                                Spacer()
+                                // Dual-color Proportional Bar (Cyan Down / Amber Up)
+                                GeometryReader { geo in
+                                    let totalWidth = geo.size.width
+                                    let groupRatio = CGFloat(Double(group.totalBytes) / max(1.0, maxTotal))
+                                    let rowWidth = totalWidth * groupRatio
+                                    let rxRatio = group.totalBytes > 0 ? CGFloat(Double(group.totalRx) / Double(group.totalBytes)) : 0.5
+                                    let rxWidth = rowWidth * rxRatio
+                                    let txWidth = rowWidth - rxWidth
 
-                                Text(formatBytes(group.totalBytes))
-                                    .font(.system(size: 11, weight: .semibold, design: .monospaced))
-                                    .foregroundColor(.white)
-                            }
-
-                            // Dual-color Proportional Bar (Cyan Down / Amber Up)
-                            GeometryReader { geo in
-                                let totalWidth = geo.size.width
-                                let groupRatio = CGFloat(Double(group.totalBytes) / max(1.0, maxTotal))
-                                let rowWidth = totalWidth * groupRatio
-                                let rxRatio = group.totalBytes > 0 ? CGFloat(Double(group.totalRx) / Double(group.totalBytes)) : 0.5
-                                let rxWidth = rowWidth * rxRatio
-                                let txWidth = rowWidth - rxWidth
-
-                                HStack(spacing: 0) {
-                                    Rectangle().fill(cyanColor).frame(width: rxWidth)
-                                    Rectangle().fill(amberColor).frame(width: txWidth)
-                                    Spacer(minLength: 0)
+                                    HStack(spacing: 0) {
+                                        Rectangle().fill(cyanColor).frame(width: rxWidth)
+                                        Rectangle().fill(amberColor).frame(width: txWidth)
+                                        Spacer(minLength: 0)
+                                    }
+                                    .frame(height: 4)
+                                    .background(Color.white.opacity(0.06))
+                                    .cornerRadius(2)
                                 }
                                 .frame(height: 4)
-                                .background(Color.white.opacity(0.06))
-                                .cornerRadius(2)
-                            }
-                            .frame(height: 4)
 
-                            // Expanded Children Lineage Tree
-                            if expandedGroups.contains(group.rootGroup) {
-                                VStack(spacing: 4) {
-                                    ForEach(group.children) { child in
-                                        HStack {
-                                            Text("└─ \(child.childComm)")
-                                                .font(.system(size: 10, design: .monospaced))
-                                                .foregroundColor(.gray)
-                                                .lineLimit(1)
-                                            Spacer()
-                                            Text(formatBytes(child.totalBytes))
-                                                .font(.system(size: 10, design: .monospaced))
-                                                .foregroundColor(.gray)
+                                // Expanded Children Lineage Tree
+                                if expandedGroups.contains(group.rootGroup) {
+                                    VStack(spacing: 4) {
+                                        ForEach(group.children) { child in
+                                            HStack {
+                                                Text("└─ \(child.childComm)")
+                                                    .font(.system(size: 10, design: .monospaced))
+                                                    .foregroundColor(.gray)
+                                                    .lineLimit(1)
+                                                Spacer()
+                                                Text(selectedRange == "LIVE" ? formatRate(Double(child.totalBytes)) : formatBytes(child.totalBytes))
+                                                    .font(.system(size: 10, design: .monospaced))
+                                                    .foregroundColor(.gray)
+                                            }
+                                            .padding(.leading, 18)
                                         }
-                                        .padding(.leading, 18)
                                     }
+                                    .padding(.vertical, 2)
                                 }
-                                .padding(.vertical, 2)
                             }
+                            .padding(8)
+                            .background(Color.white.opacity(0.025))
+                            .cornerRadius(6)
                         }
-                        .padding(8)
-                        .background(Color.white.opacity(0.025))
-                        .cornerRadius(6)
                     }
+                    .padding(.horizontal, 16)
                 }
-                .padding(.horizontal, 16)
             }
 
             // Hotspot Daily Budget Warning Gauge
@@ -252,14 +276,21 @@ public struct FlyoutPanelView: View {
         .onAppear {
             refreshData()
         }
+        .onReceive(updateTimer) { _ in
+            refreshData()
+        }
     }
 
     private func refreshData() {
         liveSummary = reader.fetchLiveSummary()
+        if selectedRange == "LIVE" {
+            processGroups = reader.fetchLiveProcessGroups()
+            return
+        }
+
         let now = Int64(Date().timeIntervalSince1970)
         let startTs: Int64
         switch selectedRange {
-        case "LIVE": startTs = now - 300
         case "24H": startTs = now - 86400
         case "2D": startTs = now - (2 * 86400)
         case "7D": startTs = now - (7 * 86400)
@@ -268,6 +299,16 @@ public struct FlyoutPanelView: View {
         }
 
         processGroups = reader.fetchProcessGroups(startTs: startTs, endTs: now, hotspotOnly: filterHotspotOnly)
+    }
+
+    private func formatRate(_ bytesPerSec: Double) -> String {
+        if bytesPerSec >= 1048576 {
+            return String(format: "%.1f MB/s", bytesPerSec / 1048576.0)
+        } else if bytesPerSec >= 1024 {
+            return String(format: "%.0f KB/s", bytesPerSec / 1024.0)
+        } else {
+            return String(format: "%.0f B/s", bytesPerSec)
+        }
     }
 
     private func formatBytes(_ bytes: Int64) -> String {

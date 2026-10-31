@@ -101,6 +101,57 @@ public class LedgerReader {
         return nil
     }
 
+    public func fetchLiveProcessGroups() -> [ProcessGroupItem] {
+        guard ensureDatabaseOpen(), let db = db else { return [] }
+        let sql = """
+            SELECT root_group, category, child_comm, child_detail, rx_rate, tx_rate
+            FROM live_state
+            ORDER BY (rx_rate + tx_rate) DESC;
+        """
+        var stmt: OpaquePointer?
+        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else { return [] }
+        defer { sqlite3_finalize(stmt) }
+
+        var groupMap: [String: (category: String, rx: Int64, tx: Int64, children: [ProcessChildItem])] = [:]
+
+        while sqlite3_step(stmt) == SQLITE_ROW {
+            let root = String(cString: sqlite3_column_text(stmt, 0))
+            let cat = String(cString: sqlite3_column_text(stmt, 1))
+            let comm = String(cString: sqlite3_column_text(stmt, 2))
+            let detail = String(cString: sqlite3_column_text(stmt, 3))
+            let rx = Int64(sqlite3_column_double(stmt, 4))
+            let tx = Int64(sqlite3_column_double(stmt, 5))
+
+            let child = ProcessChildItem(
+                childComm: comm,
+                childDetail: detail,
+                rxBytes: rx,
+                txBytes: tx,
+                totalBytes: rx + tx
+            )
+
+            if var existing = groupMap[root] {
+                existing.rx += rx
+                existing.tx += tx
+                existing.children.append(child)
+                groupMap[root] = existing
+            } else {
+                groupMap[root] = (category: cat, rx: rx, tx: tx, children: [child])
+            }
+        }
+
+        return groupMap.map { root, val in
+            ProcessGroupItem(
+                rootGroup: root,
+                category: val.category,
+                totalRx: val.rx,
+                totalTx: val.tx,
+                totalBytes: val.rx + val.tx,
+                children: val.children
+            )
+        }.sorted { $0.totalBytes > $1.totalBytes }
+    }
+
     public func fetchProcessGroups(startTs: Int64, endTs: Int64, hotspotOnly: Bool = false) -> [ProcessGroupItem] {
         guard ensureDatabaseOpen(), let db = db else { return [] }
         let table = (endTs - startTs) > (48 * 3600) ? "rollup_1hour" : "rollup_5min"
@@ -149,7 +200,7 @@ public class LedgerReader {
             }
         }
 
-        return groupMap.map { root, val in
+        let items = groupMap.map { root, val in
             ProcessGroupItem(
                 rootGroup: root,
                 category: val.category,
@@ -159,5 +210,11 @@ public class LedgerReader {
                 children: val.children
             )
         }.sorted { $0.totalBytes > $1.totalBytes }
+
+        // If historical table is empty (e.g. app was just started), fallback to live_state
+        if items.isEmpty {
+            return fetchLiveProcessGroups()
+        }
+        return items
     }
 }

@@ -3,7 +3,7 @@
 MacNetLedger Daemon (macnetledgerd)
 System-wide process lineage bandwidth ledger & mobile hotspot guardian for macOS Monterey (12.7+) and beyond.
 
-Uses Darwin native nettop kernel diagnostics, libproc path attribution,
+Uses Darwin native nettop snapshot diagnostics, libproc path attribution,
 and dual-tier SQLite time-series rollups in WAL mode.
 """
 
@@ -12,8 +12,8 @@ import ctypes
 import datetime
 import logging
 import os
+import plistlib
 import re
-import select
 import signal
 import sqlite3
 import subprocess
@@ -29,7 +29,6 @@ DEFAULT_DB_PATH = "/Library/Application Support/MacNetLedger/ledger.db"
 
 # Human-friendly mappings for known macOS system services
 MACOS_SYSTEM_DAEMONS: Dict[str, Tuple[str, str, str]] = {
-    # (Friendly Group Name, Category, Detail)
     "nsurlsessiond": ("Apple Background Transfers", "system", "iCloud, Music & App Store Downloads"),
     "cloudd": ("iCloud Drive Sync", "system", "iCloud Drive File Synchronization"),
     "bird": ("iCloud Documents", "system", "iCloud Desktop & Documents Daemon"),
@@ -74,9 +73,73 @@ MACOS_CLI_TOOLS: Dict[str, Tuple[str, str]] = {
     "dockerd": ("Docker Daemon", "dev"),
 }
 
-# Lineage cache: pid -> (cache_time, (root_group, category, child_comm, child_detail))
 LINEAGE_CACHE: Dict[int, Tuple[float, Tuple[str, str, str, str]]] = {}
 CACHE_TTL_SEC = 5.0
+
+
+def extract_nettop_processes(data) -> List[Tuple[str, int, int, int]]:
+    """Extracts (comm, pid, bytes_in, bytes_out) from parsed nettop XML plist."""
+    entries = []
+    candidates = []
+    if isinstance(data, dict):
+        for k in ["Processes", "processes", "nettop", "entries"]:
+            if k in data and isinstance(data[k], list):
+                candidates = data[k]
+                break
+        if not candidates and "interfaces" in data and isinstance(data["interfaces"], list):
+            for iface in data["interfaces"]:
+                if isinstance(iface, dict) and "processes" in iface:
+                    candidates.extend(iface["processes"])
+    elif isinstance(data, list):
+        candidates = data
+
+    for item in candidates:
+        if not isinstance(item, dict):
+            continue
+        name = str(item.get("name") or item.get("process_name") or "")
+        pid = int(item.get("pid") or 0)
+        if not pid and "." in name:
+            parts = name.rsplit(".", 1)
+            if parts[1].isdigit():
+                name = parts[0]
+                pid = int(parts[1])
+        rx = int(item.get("bytes_in", 0))
+        tx = int(item.get("bytes_out", 0))
+        if name and pid:
+            entries.append((name, pid, rx, tx))
+    return entries
+
+
+class NetTopParser:
+    """Fallback parser for legacy CSV output formats."""
+
+    @staticmethod
+    def parse_line(line: str) -> Optional[Tuple[str, int, int, int, str]]:
+        line = line.strip()
+        if not line or line.startswith("time") or line.startswith("bytes_in") or line.startswith("==="):
+            return None
+
+        parts = [p.strip() for p in line.split(",")]
+        if len(parts) < 4:
+            return None
+
+        proc_target = parts[1]
+        if "." not in proc_target:
+            return None
+
+        comm, pid_str = proc_target.rsplit(".", 1)
+        if not pid_str.isdigit():
+            return None
+
+        pid = int(pid_str)
+        try:
+            rx_bytes = int(float(parts[2]))
+            tx_bytes = int(float(parts[3]))
+        except ValueError:
+            return None
+
+        interface = parts[4] if len(parts) > 4 else "en0"
+        return comm, pid, rx_bytes, tx_bytes, interface
 
 
 class DarwinProcessResolver:
@@ -97,7 +160,6 @@ class DarwinProcessResolver:
                 logger.warning("Could not initialize Darwin proc_pidpath: %s", e)
 
     def get_process_path(self, pid: int) -> Optional[str]:
-        """Returns the absolute executable path for a given PID using proc_pidpath."""
         if not self._proc_pidpath or pid <= 0:
             return None
         buf = ctypes.create_string_buffer(4096)
@@ -107,17 +169,12 @@ class DarwinProcessResolver:
         return None
 
     def resolve(self, pid: int, raw_comm: str) -> Tuple[str, str, str, str]:
-        """
-        Resolves (root_group, category, child_comm, child_detail).
-        Uses caching to ensure ultra-low CPU overhead.
-        """
         now = time.time()
         if pid in LINEAGE_CACHE:
             ts, cached = LINEAGE_CACHE[pid]
             if now - ts < CACHE_TTL_SEC:
                 return cached
 
-        # Check known system daemons by command name
         base_comm = raw_comm.split("/")[-1].strip()
         if base_comm in MACOS_SYSTEM_DAEMONS:
             group, cat, detail = MACOS_SYSTEM_DAEMONS[base_comm]
@@ -125,18 +182,14 @@ class DarwinProcessResolver:
             LINEAGE_CACHE[pid] = (now, res)
             return res
 
-        # Check known CLI tools
         if base_comm in MACOS_CLI_TOOLS:
             group, cat = MACOS_CLI_TOOLS[base_comm]
             res = (group, cat, base_comm, f"{base_comm} (CLI execution)")
             LINEAGE_CACHE[pid] = (now, res)
             return res
 
-        # Query process path via libproc
         path = self.get_process_path(pid)
         if path:
-            # 1. Is it inside a macOS .app bundle?
-            # e.g., /Applications/Google Chrome.app/Contents/Frameworks/.../Google Chrome Helper (Renderer).app/...
             app_match = re.search(r"/(?:Applications|System/Applications|Users/[^/]+/Applications)/([^/]+)\.app", path)
             if app_match:
                 app_name = app_match.group(1)
@@ -146,7 +199,6 @@ class DarwinProcessResolver:
                 LINEAGE_CACHE[pid] = (now, res)
                 return res
 
-            # 2. Is it in /System/Library or /usr/libexec?
             if path.startswith("/System/Library/") or path.startswith("/usr/libexec/"):
                 binary_name = path.split("/")[-1]
                 if binary_name in MACOS_SYSTEM_DAEMONS:
@@ -157,13 +209,11 @@ class DarwinProcessResolver:
                 LINEAGE_CACHE[pid] = (now, res)
                 return res
 
-            # 3. User binary or Homebrew package
             detail = path.split("/")[-1]
             res = (base_comm, "cli", base_comm, detail)
             LINEAGE_CACHE[pid] = (now, res)
             return res
 
-        # Fallback if path lookup failed (e.g. process terminated quickly)
         res = (base_comm, "app" if base_comm[0].isupper() else "cli", base_comm, base_comm)
         LINEAGE_CACHE[pid] = (now, res)
         return res
@@ -176,13 +226,9 @@ class NetworkStateDetector:
 
     def __init__(self):
         self.last_check = 0.0
-        self.cached_state = ("Unknown", False)
+        self.cached_state = ("Wi-Fi", False)
 
     def get_network_state(self) -> Tuple[str, bool]:
-        """
-        Returns (network_name, is_hotspot).
-        Cached for 4 seconds to eliminate command execution overhead.
-        """
         now = time.time()
         if now - self.last_check < 4.0:
             return self.cached_state
@@ -191,7 +237,6 @@ class NetworkStateDetector:
         is_hotspot = False
 
         if sys.platform == "darwin":
-            # Attempt 1: Query airport binary for active Wi-Fi SSID
             airport_bin = "/System/Library/PrivateFrameworks/Apple80211.framework/Versions/Current/Resources/airport"
             try:
                 if os.path.exists(airport_bin):
@@ -202,14 +247,12 @@ class NetworkStateDetector:
                             network_name = line.split(":", 1)[1].strip()
                             break
                 else:
-                    # Attempt 2: networksetup fallback
                     res = subprocess.run(["networksetup", "-getairportnetwork", "en0"], capture_output=True, text=True, timeout=1.0)
                     if "Current Wi-Fi Network:" in res.stdout:
                         network_name = res.stdout.split(":", 1)[1].strip()
             except Exception:
                 pass
 
-        # Check for Hotspot indicators in SSID
         lower_name = network_name.lower()
         if any(kw in lower_name for kw in self.HOTSPOT_KEYWORDS):
             is_hotspot = True
@@ -231,18 +274,15 @@ class MacLedgerStorage:
     def _ensure_dir(self):
         try:
             self.db_path.parent.mkdir(parents=True, exist_ok=True)
-        except PermissionError:
-            fallback = Path.home() / "Library/Application Support/MacNetLedger/ledger.db"
-            logger.warning("Permission denied for %s, falling back to %s", self.db_path, fallback)
-            fallback.parent.mkdir(parents=True, exist_ok=True)
-            self.db_path = fallback
+            os.chmod(self.db_path.parent, 0o777)
+        except Exception:
+            pass
 
     def _init_db(self):
         cur = self.conn.cursor()
         cur.execute("PRAGMA journal_mode = WAL;")
         cur.execute("PRAGMA synchronous = NORMAL;")
 
-        # Tier 1: 5-minute buckets (Retained for 14 days)
         cur.execute("""
             CREATE TABLE IF NOT EXISTS rollup_5min (
                 bucket_ts     INTEGER NOT NULL,
@@ -260,7 +300,6 @@ class MacLedgerStorage:
         cur.execute("CREATE INDEX IF NOT EXISTS idx_rollup_5min_ts ON rollup_5min(bucket_ts);")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_rollup_5min_hotspot ON rollup_5min(is_hotspot);")
 
-        # Tier 2: 1-hour buckets (Retained for 400+ days)
         cur.execute("""
             CREATE TABLE IF NOT EXISTS rollup_1hour (
                 bucket_ts     INTEGER NOT NULL,
@@ -277,7 +316,6 @@ class MacLedgerStorage:
         """)
         cur.execute("CREATE INDEX IF NOT EXISTS idx_rollup_1hour_ts ON rollup_1hour(bucket_ts);")
 
-        # Live Real-time rates (updated every 2 seconds for Menu Bar UI)
         cur.execute("""
             CREATE TABLE IF NOT EXISTS live_state (
                 updated_at    INTEGER NOT NULL,
@@ -306,7 +344,6 @@ class MacLedgerStorage:
             );
         """)
 
-        # Hotspot Daily Budget tracker
         cur.execute("""
             CREATE TABLE IF NOT EXISTS hotspot_budget (
                 id                 INTEGER PRIMARY KEY CHECK (id = 1),
@@ -316,30 +353,29 @@ class MacLedgerStorage:
             );
         """)
 
-        # Seed initial row for budget if not exists
         cur.execute("""
             INSERT OR IGNORE INTO hotspot_budget (id, daily_budget_bytes, today_bytes, last_reset_day)
             VALUES (1, 3221225472, 0, ?);
         """, (datetime.date.today().isoformat(),))
 
+        # Seed initial empty summary if not exists
+        cur.execute("""
+            INSERT OR IGNORE INTO live_summary (id, updated_at, rx_rate, tx_rate, top_process, top_category, network_name, is_hotspot, hotspot_today_bytes)
+            VALUES (1, ?, 0, 0, '', '', 'Wi-Fi', 0, 0);
+        """, (int(time.time()),))
+
         self.conn.commit()
         self._ensure_file_permissions()
 
     def _ensure_file_permissions(self):
-        """Ensures ledger DB and WAL files are world-readable for unprivileged UI access."""
         for p in [self.db_path, self.db_path.with_name(self.db_path.name + "-wal"), self.db_path.with_name(self.db_path.name + "-shm")]:
             try:
                 if p.exists():
                     os.chmod(p, 0o666)
-            except Exception as e:
-                logger.debug("Could not chmod %s: %s", p, e)
+            except Exception:
+                pass
 
     def record_deltas(self, deltas: Dict[Tuple[int, str, str, str, str, str, int], Tuple[int, int]]):
-        """
-        Commits byte deltas to rollup_5min.
-        Key: (bucket_ts, root_group, category, child_comm, child_detail, network_name, is_hotspot)
-        Value: (rx_bytes, tx_bytes)
-        """
         if not deltas:
             return
 
@@ -369,7 +405,6 @@ class MacLedgerStorage:
         is_hotspot: bool,
         hotspot_today_bytes: int
     ):
-        """Updates instantaneous live rates and summary state."""
         cur = self.conn.cursor()
         now = int(time.time())
 
@@ -386,9 +421,9 @@ class MacLedgerStorage:
             VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?);
         """, (now, total_rx_rate, total_tx_rate, top_process, top_category, network_name, 1 if is_hotspot else 0, hotspot_today_bytes))
         self.conn.commit()
+        self._ensure_file_permissions()
 
     def update_hotspot_budget(self, delta_bytes: int) -> int:
-        """Accumulates mobile hotspot consumption for today and resets on day boundary."""
         cur = self.conn.cursor()
         today_iso = datetime.date.today().isoformat()
 
@@ -410,18 +445,12 @@ class MacLedgerStorage:
         return current_today
 
     def prune_and_rollup(self):
-        """
-        Rolls up 5-minute buckets older than 1 hour into 1-hour buckets and prunes retention.
-        - rollup_5min retention: 14 days
-        - rollup_1hour retention: 400 days
-        """
         cur = self.conn.cursor()
         now = int(time.time())
         one_hour_ago = now - 3600
         fourteen_days_ago = now - (14 * 86400)
         four_hundred_days_ago = now - (400 * 86400)
 
-        # 1. Rollup 5min buckets older than 1 hour into rollup_1hour
         rollup_sql = """
             INSERT INTO rollup_1hour (bucket_ts, root_group, category, child_comm, child_detail, network_name, is_hotspot, rx_bytes, tx_bytes)
             SELECT
@@ -442,92 +471,61 @@ class MacLedgerStorage:
                 tx_bytes = excluded.tx_bytes;
         """
         cur.execute(rollup_sql, (one_hour_ago,))
-
-        # 2. Prune rollup_5min older than 14 days
         cur.execute("DELETE FROM rollup_5min WHERE bucket_ts < ?;", (fourteen_days_ago,))
-
-        # 3. Prune rollup_1hour older than 400 days
         cur.execute("DELETE FROM rollup_1hour WHERE bucket_ts < ?;", (four_hundred_days_ago,))
-
         self.conn.commit()
         self._ensure_file_permissions()
-        logger.info("Executed database maintenance and retention pruning.")
 
 
-class NetTopParser:
-    """Parses streaming CSV output from macOS `/usr/bin/nettop`."""
+class NetTopSnapshotCollector:
+    """Takes periodic non-blocking snapshots using `/usr/bin/nettop -P -L 1 -x`."""
 
-    @staticmethod
-    def parse_line(line: str) -> Optional[Tuple[str, int, int, int, str]]:
+    def __init__(self):
+        self.last_totals: Dict[int, Tuple[int, int]] = {}
+        self.last_time = time.time()
+
+    def sample(self) -> List[Tuple[str, int, int, int]]:
         """
-        Parses a single line of nettop CSV output.
-        Format emitted by: nettop -P -d -s 2 -L 0 -J bytes_in,bytes_out,interface
-        Expected fields: <timestamp>,<proc_name>.<pid>,<bytes_in>,<bytes_out>[,<interface>]
-        Returns: (comm, pid, bytes_in, bytes_out, interface)
+        Runs nettop for 1 snapshot, calculates deltas since last sample.
+        Returns: list of (comm, pid, rx_delta, tx_delta)
         """
-        line = line.strip()
-        if not line or line.startswith("time") or line.startswith("bytes_in") or line.startswith("==="):
-            return None
+        now = time.time()
+        elapsed = max(0.5, now - self.last_time)
+        self.last_time = now
 
-        parts = [p.strip() for p in line.split(",")]
-        # Needs at least: [time, proc.pid, bytes_in, bytes_out]
-        if len(parts) < 4:
-            return None
-
-        proc_target = parts[1]
-        if "." not in proc_target:
-            return None
-
-        # Split from the right for PID in case app name contains dots
-        comm, pid_str = proc_target.rsplit(".", 1)
-        if not pid_str.isdigit():
-            return None
-
-        pid = int(pid_str)
-
+        cmd = ["/usr/bin/nettop", "-P", "-L", "1", "-x"]
         try:
-            rx_bytes = int(float(parts[2]))
-            tx_bytes = int(float(parts[3]))
-        except ValueError:
-            return None
+            res = subprocess.run(cmd, capture_output=True, timeout=4.0)
+            if res.returncode != 0 or not res.stdout:
+                return []
+            data = plistlib.loads(res.stdout)
+            current_entries = extract_nettop_processes(data)
+        except Exception as e:
+            logger.debug("nettop snapshot error: %s", e)
+            return []
 
-        interface = parts[4] if len(parts) > 4 else "en0"
-        return comm, pid, rx_bytes, tx_bytes, interface
+        deltas = []
+        current_pids = set()
 
+        for comm, pid, rx_total, tx_total in current_entries:
+            current_pids.add(pid)
+            if pid in self.last_totals:
+                prev_rx, prev_tx = self.last_totals[pid]
+                rx_delta = max(0, rx_total - prev_rx)
+                tx_delta = max(0, tx_total - prev_tx)
+            else:
+                rx_delta = 0
+                tx_delta = 0
 
-class NetTopCollector:
-    """Streams live network throughput from macOS nettop."""
+            self.last_totals[pid] = (rx_total, tx_total)
+            deltas.append((comm, pid, rx_delta, tx_delta))
 
-    def __init__(self, interval: int = 2):
-        self.interval = max(1, interval)
-        self.process = None
+        # Evict terminated PIDs from cache
+        for old_pid in list(self.last_totals.keys()):
+            if old_pid not in current_pids:
+                del self.last_totals[old_pid]
 
-    def start(self):
-        cmd = [
-            "/usr/bin/nettop",
-            "-P",
-            "-d",
-            "-s", str(self.interval),
-            "-L", "0",
-            "-J", "bytes_in,bytes_out,interface"
-        ]
-        logger.info("Starting nettop stream: %s", " ".join(cmd))
-        self.process = subprocess.Popen(
-            cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
-            text=True,
-            bufsize=1
-        )
-
-    def stop(self):
-        if self.process:
-            try:
-                self.process.terminate()
-                self.process.wait(timeout=2)
-            except Exception:
-                self.process.kill()
-            self.process = None
+        return deltas
 
 
 def main():
@@ -546,9 +544,8 @@ def main():
     storage = MacLedgerStorage(args.db)
     resolver = DarwinProcessResolver()
     net_detector = NetworkStateDetector()
-    collector = NetTopCollector(interval=args.interval)
+    collector = NetTopSnapshotCollector()
 
-    # State tracking
     running = True
 
     def sig_handler(signum, frame):
@@ -559,104 +556,76 @@ def main():
     signal.signal(signal.SIGINT, sig_handler)
     signal.signal(signal.SIGTERM, sig_handler)
 
-    collector.start()
-
     last_prune_time = time.time()
-    last_flush_time = time.time()
     pending_deltas: Dict[Tuple[int, str, str, str, str, str, int], Tuple[int, int]] = {}
 
-    # Sample batch buffer
-    current_tick_records: List[Tuple[int, str, str, str, str, float, float]] = []
+    while running:
+        tick_start = time.time()
+        deltas = collector.sample()
+        now = time.time()
 
-    try:
-        while running and collector.process and collector.process.stdout:
-            # Non-blocking wait for next nettop line
-            r, _, _ = select.select([collector.process.stdout], [], [], 1.0)
-            if not r:
-                continue
+        network_name, is_hotspot = net_detector.get_network_state()
+        current_tick_records = []
+        tick_hotspot_bytes = 0
 
-            line = collector.process.stdout.readline()
-            if not line:
-                if collector.process.poll() is not None:
-                    logger.warning("nettop exited with code %s. Restarting...", collector.process.returncode)
-                    collector.start()
-                continue
-
-            parsed = NetTopParser.parse_line(line)
-            if not parsed:
-                continue
-
-            comm, pid, rx_bytes, tx_bytes, interface = parsed
-            # Ignore zero-delta ticks
+        for comm, pid, rx_bytes, tx_bytes in deltas:
             if rx_bytes == 0 and tx_bytes == 0:
                 continue
 
-            now = time.time()
-            network_name, is_hotspot = net_detector.get_network_state()
             root_group, category, child_comm, child_detail = resolver.resolve(pid, comm)
-
-            # Bucket timestamp aligned to 5 minutes (300 seconds)
             bucket_ts = (int(now) // 300) * 300
             key = (bucket_ts, root_group, category, child_comm, child_detail, network_name, 1 if is_hotspot else 0)
 
-            # Accumulate in 5-minute rollup deltas
             prev_rx, prev_tx = pending_deltas.get(key, (0, 0))
             pending_deltas[key] = (prev_rx + rx_bytes, prev_tx + tx_bytes)
 
-            # Convert to rates (bytes per second)
             rx_rate = rx_bytes / args.interval
             tx_rate = tx_bytes / args.interval
             current_tick_records.append((pid, root_group, category, child_comm, child_detail, rx_rate, tx_rate))
 
-            # Update hotspot budget if on hotspot
-            hotspot_today = 0
             if is_hotspot:
-                hotspot_today = storage.update_hotspot_budget(rx_bytes + tx_bytes)
+                tick_hotspot_bytes += (rx_bytes + tx_bytes)
 
-            # Periodic commit to SQLite (every 2-4 seconds)
-            if now - last_flush_time >= args.interval:
-                if pending_deltas:
-                    storage.record_deltas(pending_deltas)
-                    pending_deltas.clear()
-
-                # Calculate live rates and top hog
-                total_rx_rate = sum(r[5] for r in current_tick_records)
-                total_tx_rate = sum(r[6] for r in current_tick_records)
-
-                top_process = ""
-                top_category = ""
-                if current_tick_records:
-                    top_record = max(current_tick_records, key=lambda r: r[5] + r[6])
-                    if (top_record[5] + top_record[6]) > 1024:  # At least 1 KB/s to trigger top label
-                        top_process = top_record[1]
-                        top_category = top_record[2]
-
-                storage.update_live_state(
-                    current_tick_records,
-                    total_rx_rate,
-                    total_tx_rate,
-                    top_process,
-                    top_category,
-                    network_name,
-                    is_hotspot,
-                    hotspot_today
-                )
-
-                current_tick_records.clear()
-                last_flush_time = now
-
-            # Maintenance pruning and 1-hour rollups every 30 minutes
-            if now - last_prune_time >= 1800:
-                storage.prune_and_rollup()
-                last_prune_time = now
-
-    except Exception as e:
-        logger.exception("Unexpected error in daemon main loop: %s", e)
-    finally:
-        collector.stop()
         if pending_deltas:
             storage.record_deltas(pending_deltas)
-        logger.info("MacNetLedger Daemon stopped cleanly.")
+            pending_deltas.clear()
+
+        hotspot_today = 0
+        if tick_hotspot_bytes > 0:
+            hotspot_today = storage.update_hotspot_budget(tick_hotspot_bytes)
+
+        total_rx_rate = sum(r[5] for r in current_tick_records)
+        total_tx_rate = sum(r[6] for r in current_tick_records)
+
+        top_process = ""
+        top_category = ""
+        if current_tick_records:
+            top_record = max(current_tick_records, key=lambda r: r[5] + r[6])
+            if (top_record[5] + top_record[6]) > 1024:
+                top_process = top_record[1]
+                top_category = top_record[2]
+
+        storage.update_live_state(
+            current_tick_records,
+            total_rx_rate,
+            total_tx_rate,
+            top_process,
+            top_category,
+            network_name,
+            is_hotspot,
+            hotspot_today
+        )
+
+        if now - last_prune_time >= 1800:
+            storage.prune_and_rollup()
+            last_prune_time = now
+
+        # Sleep remaining time to maintain consistent interval
+        elapsed = time.time() - tick_start
+        sleep_time = max(0.2, float(args.interval) - elapsed)
+        time.sleep(sleep_time)
+
+    logger.info("MacNetLedger Daemon stopped cleanly.")
 
 
 if __name__ == "__main__":
