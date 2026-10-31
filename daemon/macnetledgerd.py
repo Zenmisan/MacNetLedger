@@ -114,7 +114,7 @@ def parse_nettop_text_line(line: str) -> Optional[Tuple[str, int, int, int]]:
       safari.1234,1245890,45210
       Telegram.15820   en0   154820   42300
     """
-    line = line.strip()
+    line = line.strip().strip(",")
     if not line or "bytes_in" in line or line.startswith("===") or line.startswith("time") or line.startswith("process"):
         return None
 
@@ -570,14 +570,12 @@ class NetTopSnapshotCollector:
     def __init__(self):
         self.last_totals: Dict[int, Tuple[int, int]] = {}
         self.last_time = time.time()
-        self._working_cmd: Optional[List[str]] = None
+        self._working_cmd: Optional[List[str]] = ["/usr/bin/nettop", "-P", "-L", "1", "-J", "bytes_in,bytes_out"]
 
     def _execute_nettop(self) -> Tuple[int, bytes, bytes]:
         candidates = [
-            ["/usr/bin/nettop", "-P", "-L", "1", "-J", "bytes_in,bytes_out", "-x"],
-            ["/usr/bin/nettop", "-P", "-L", "1", "-x"],
-            ["/usr/bin/nettop", "-P", "-l", "1", "-J", "bytes_in,bytes_out", "-x"],
             ["/usr/bin/nettop", "-P", "-L", "1", "-J", "bytes_in,bytes_out"],
+            ["/usr/bin/nettop", "-P", "-l", "1", "-J", "bytes_in,bytes_out"],
             ["/usr/bin/nettop", "-P", "-L", "1"],
             ["/usr/bin/nettop", "-P", "-l", "1"],
         ]
@@ -587,7 +585,7 @@ class NetTopSnapshotCollector:
 
         for cmd in candidates:
             try:
-                res = subprocess.run(cmd, capture_output=True, timeout=5.0)
+                res = subprocess.run(cmd, capture_output=True, timeout=2.0)
                 if res.returncode == 0 and res.stdout and len(res.stdout) > 20:
                     self._working_cmd = cmd
                     return res.returncode, res.stdout, res.stderr
@@ -694,64 +692,67 @@ def main():
 
     while running:
         tick_start = time.time()
-        deltas = collector.sample()
-        now = time.time()
+        try:
+            deltas = collector.sample()
+            now = time.time()
 
-        network_name, is_hotspot = net_detector.get_network_state()
-        current_tick_records = []
-        tick_hotspot_bytes = 0
+            network_name, is_hotspot = net_detector.get_network_state()
+            current_tick_records = []
+            tick_hotspot_bytes = 0
 
-        for comm, pid, rx_bytes, tx_bytes in deltas:
-            if rx_bytes == 0 and tx_bytes == 0:
-                continue
+            for comm, pid, rx_bytes, tx_bytes in deltas:
+                if rx_bytes == 0 and tx_bytes == 0:
+                    continue
 
-            root_group, category, child_comm, child_detail = resolver.resolve(pid, comm)
-            bucket_ts = (int(now) // 300) * 300
-            key = (bucket_ts, root_group, category, child_comm, child_detail, network_name, 1 if is_hotspot else 0)
+                root_group, category, child_comm, child_detail = resolver.resolve(pid, comm)
+                bucket_ts = (int(now) // 300) * 300
+                key = (bucket_ts, root_group, category, child_comm, child_detail, network_name, 1 if is_hotspot else 0)
 
-            prev_rx, prev_tx = pending_deltas.get(key, (0, 0))
-            pending_deltas[key] = (prev_rx + rx_bytes, prev_tx + tx_bytes)
+                prev_rx, prev_tx = pending_deltas.get(key, (0, 0))
+                pending_deltas[key] = (prev_rx + rx_bytes, prev_tx + tx_bytes)
 
-            rx_rate = rx_bytes / args.interval
-            tx_rate = tx_bytes / args.interval
-            current_tick_records.append((pid, root_group, category, child_comm, child_detail, rx_rate, tx_rate))
+                rx_rate = rx_bytes / args.interval
+                tx_rate = tx_bytes / args.interval
+                current_tick_records.append((pid, root_group, category, child_comm, child_detail, rx_rate, tx_rate))
 
-            if is_hotspot:
-                tick_hotspot_bytes += (rx_bytes + tx_bytes)
+                if is_hotspot:
+                    tick_hotspot_bytes += (rx_bytes + tx_bytes)
 
-        if pending_deltas:
-            storage.record_deltas(pending_deltas)
-            pending_deltas.clear()
+            if pending_deltas:
+                storage.record_deltas(pending_deltas)
+                pending_deltas.clear()
 
-        hotspot_today = 0
-        if tick_hotspot_bytes > 0:
-            hotspot_today = storage.update_hotspot_budget(tick_hotspot_bytes)
+            hotspot_today = 0
+            if tick_hotspot_bytes > 0:
+                hotspot_today = storage.update_hotspot_budget(tick_hotspot_bytes)
 
-        total_rx_rate = sum(r[5] for r in current_tick_records)
-        total_tx_rate = sum(r[6] for r in current_tick_records)
+            total_rx_rate = sum(r[5] for r in current_tick_records)
+            total_tx_rate = sum(r[6] for r in current_tick_records)
 
-        top_process = ""
-        top_category = ""
-        if current_tick_records:
-            top_record = max(current_tick_records, key=lambda r: r[5] + r[6])
-            if (top_record[5] + top_record[6]) > 1024:
-                top_process = top_record[1]
-                top_category = top_record[2]
+            top_process = ""
+            top_category = ""
+            if current_tick_records:
+                top_record = max(current_tick_records, key=lambda r: r[5] + r[6])
+                if (top_record[5] + top_record[6]) > 1024:
+                    top_process = top_record[1]
+                    top_category = top_record[2]
 
-        storage.update_live_state(
-            current_tick_records,
-            total_rx_rate,
-            total_tx_rate,
-            top_process,
-            top_category,
-            network_name,
-            is_hotspot,
-            hotspot_today
-        )
+            storage.update_live_state(
+                current_tick_records,
+                total_rx_rate,
+                total_tx_rate,
+                top_process,
+                top_category,
+                network_name,
+                is_hotspot,
+                hotspot_today
+            )
 
-        if now - last_prune_time >= 1800:
-            storage.prune_and_rollup()
-            last_prune_time = now
+            if now - last_prune_time >= 1800:
+                storage.prune_and_rollup()
+                last_prune_time = now
+        except Exception as e:
+            logger.exception("Unexpected error in daemon main tick: %s", e)
 
         # Sleep remaining time to maintain consistent interval
         elapsed = time.time() - tick_start

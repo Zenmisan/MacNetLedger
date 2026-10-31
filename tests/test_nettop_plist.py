@@ -34,10 +34,17 @@ class TestNettopParsers(unittest.TestCase):
         res3 = parse_nettop_text_line(line3)
         self.assertEqual(res3, ("Telegram", 15820, 154820, 42300))
 
-        # Comma-separated
-        line4 = "safari.1234,1245890,45210"
+        # Comma-separated with trailing comma (real Darwin Monterey nettop output)
+        line4 = "Telegram.17231,125247,25256,"
         res4 = parse_nettop_text_line(line4)
-        self.assertEqual(res4, ("safari", 1234, 1245890, 45210))
+        self.assertEqual(res4, ("Telegram", 17231, 125247, 25256))
+
+        line4b = "Google Chrome H.767,700218,50151,"
+        res4b = parse_nettop_text_line(line4b)
+        self.assertEqual(res4b, ("Google Chrome H", 767, 700218, 50151))
+
+        # Header with commas
+        self.assertIsNone(parse_nettop_text_line(",bytes_in,bytes_out,"))
 
         # Human-readable suffixes
         line5 = "Telegram.15820   150 KiB   40 KiB"
