@@ -94,10 +94,9 @@ class TestMacLedgerStorage(unittest.TestCase):
     def test_rollup_1hour_aggregation(self):
         cur = self.storage.conn.cursor()
         now = int(time.time())
-        two_hours_ago = now - 7200
-        # Align to 5-min
-        bucket_1 = (two_hours_ago // 300) * 300
-        bucket_2 = bucket_1 + 300
+        h_base = ((now - 7200) // 3600) * 3600
+        bucket_1 = h_base + 300
+        bucket_2 = h_base + 600
 
         deltas = {
             (bucket_1, "cURL", "cli", "curl", "curl fetch", "Zenmi's iPhone", 1): (2000, 500),

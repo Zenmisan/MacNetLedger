@@ -140,7 +140,7 @@ public class LedgerReader {
             }
         }
 
-        return groupMap.map { root, val in
+        let items = groupMap.map { root, val in
             ProcessGroupItem(
                 rootGroup: root,
                 category: val.category,
@@ -150,6 +150,15 @@ public class LedgerReader {
                 children: val.children
             )
         }.sorted { $0.totalBytes > $1.totalBytes }
+
+        // If no processes are actively transferring data right this second,
+        // show the most recent 1-hour rollup so the screen is never blank
+        if items.isEmpty {
+            let now = Int64(Date().timeIntervalSince1970)
+            return fetchProcessGroups(startTs: now - 3600, endTs: now)
+        }
+
+        return items
     }
 
     public func fetchProcessGroups(startTs: Int64, endTs: Int64, hotspotOnly: Bool = false) -> [ProcessGroupItem] {
@@ -211,9 +220,34 @@ public class LedgerReader {
             )
         }.sorted { $0.totalBytes > $1.totalBytes }
 
-        // If historical table is empty (e.g. app was just started), fallback to live_state
+        // If historical table is empty (e.g. app was just started), fallback directly to live_state
         if items.isEmpty {
-            return fetchLiveProcessGroups()
+            let liveSql = "SELECT root_group, category, child_comm, child_detail, rx_rate, tx_rate FROM live_state ORDER BY (rx_rate + tx_rate) DESC;"
+            var liveStmt: OpaquePointer?
+            if sqlite3_prepare_v2(db, liveSql, -1, &liveStmt, nil) == SQLITE_OK {
+                defer { sqlite3_finalize(liveStmt) }
+                var liveMap: [String: (category: String, rx: Int64, tx: Int64, children: [ProcessChildItem])] = [:]
+                while sqlite3_step(liveStmt) == SQLITE_ROW {
+                    let root = String(cString: sqlite3_column_text(liveStmt, 0))
+                    let cat = String(cString: sqlite3_column_text(liveStmt, 1))
+                    let comm = String(cString: sqlite3_column_text(liveStmt, 2))
+                    let detail = String(cString: sqlite3_column_text(liveStmt, 3))
+                    let rx = Int64(sqlite3_column_double(liveStmt, 4))
+                    let tx = Int64(sqlite3_column_double(liveStmt, 5))
+                    let child = ProcessChildItem(childComm: comm, childDetail: detail, rxBytes: rx, txBytes: tx, totalBytes: rx + tx)
+                    if var existing = liveMap[root] {
+                        existing.rx += rx
+                        existing.tx += tx
+                        existing.children.append(child)
+                        liveMap[root] = existing
+                    } else {
+                        liveMap[root] = (category: cat, rx: rx, tx: tx, children: [child])
+                    }
+                }
+                return liveMap.map { root, val in
+                    ProcessGroupItem(rootGroup: root, category: val.category, totalRx: val.rx, totalTx: val.tx, totalBytes: val.rx + val.tx, children: val.children)
+                }.sorted { $0.totalBytes > $1.totalBytes }
+            }
         }
         return items
     }

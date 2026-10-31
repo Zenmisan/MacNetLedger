@@ -3,7 +3,7 @@ import SwiftUI
 public struct FlyoutPanelView: View {
     public let reader: LedgerReader
 
-    @State private var selectedRange: String = "LIVE"
+    @State private var selectedRange: String = "24H"
     @State private var filterHotspotOnly: Bool = false
     @State private var expandedGroups: Set<String> = []
     @State private var processGroups: [ProcessGroupItem] = []

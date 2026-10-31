@@ -77,6 +77,88 @@ LINEAGE_CACHE: Dict[int, Tuple[float, Tuple[str, str, str, str]]] = {}
 CACHE_TTL_SEC = 5.0
 
 
+def parse_byte_value(val: str) -> int:
+    """Parses a string representing bytes or human-readable format (e.g. '154820', '4.2 MiB', '153 KiB')."""
+    val = val.strip().replace(",", "")
+    if not val:
+        return 0
+    try:
+        return int(val)
+    except ValueError:
+        pass
+
+    match = re.match(r"^([\d.]+)\s*([A-Za-z]+)?$", val)
+    if not match:
+        return 0
+
+    num = float(match.group(1))
+    unit = (match.group(2) or "").upper()
+    multiplier = 1
+    if unit in ("K", "KB", "KIB"):
+        multiplier = 1024
+    elif unit in ("M", "MB", "MIB"):
+        multiplier = 1024 * 1024
+    elif unit in ("G", "GB", "GIB"):
+        multiplier = 1024 * 1024 * 1024
+    elif unit in ("T", "TB", "TIB"):
+        multiplier = 1024 * 1024 * 1024 * 1024
+    return int(num * multiplier)
+
+
+def parse_nettop_text_line(line: str) -> Optional[Tuple[str, int, int, int]]:
+    """
+    Parses a single line of nettop text/CSV output into (comm, pid, rx_bytes, tx_bytes).
+    Handles:
+      Google Chrome.3821   48291024   1284920
+      Telegram.15820       154820     42300
+      safari.1234,1245890,45210
+      Telegram.15820   en0   154820   42300
+    """
+    line = line.strip()
+    if not line or "bytes_in" in line or line.startswith("===") or line.startswith("time") or line.startswith("process"):
+        return None
+
+    if "," in line:
+        parts = [p.strip() for p in line.split(",") if p.strip()]
+    else:
+        parts = line.split()
+
+    if len(parts) < 3:
+        return None
+
+    # Handle cases where unit is separated by space, e.g. "150 KiB 40 KiB"
+    if parts[-1].upper() in ("B", "KB", "KIB", "MB", "MIB", "GB", "GIB", "TB", "TIB") and len(parts) >= 5:
+        tx_str = parts[-2] + parts[-1]
+        if parts[-3].upper() in ("B", "KB", "KIB", "MB", "MIB", "GB", "GIB", "TB", "TIB"):
+            rx_str = parts[-4] + parts[-3]
+            proc_parts = parts[:-4]
+        else:
+            rx_str = parts[-3]
+            proc_parts = parts[:-3]
+    else:
+        rx_str = parts[-2]
+        tx_str = parts[-1]
+        proc_parts = parts[:-2]
+
+    rx_val = parse_byte_value(rx_str)
+    tx_val = parse_byte_value(tx_str)
+
+    # Filter out interface names like en0, pdp_ip0, etc. if attached
+    if len(proc_parts) > 1 and re.match(r"^(en\d+|pdp_ip\d+|lo\d+|utun\d+|awdl\d+|llw\d+|bridge\d+|ap\d+)$", proc_parts[-1]):
+        proc_parts = proc_parts[:-1]
+
+    proc_str = " ".join(proc_parts)
+    if "." not in proc_str:
+        return None
+
+    comm, pid_str = proc_str.rsplit(".", 1)
+    if not pid_str.isdigit():
+        return None
+
+    pid = int(pid_str)
+    return (comm.strip(), pid, rx_val, tx_val)
+
+
 def extract_nettop_processes(data) -> List[Tuple[str, int, int, int]]:
     """Extracts (comm, pid, bytes_in, bytes_out) from parsed nettop XML plist."""
     entries = []
@@ -478,11 +560,36 @@ class MacLedgerStorage:
 
 
 class NetTopSnapshotCollector:
-    """Takes periodic non-blocking snapshots using `/usr/bin/nettop -P -L 1 -x`."""
+    """Takes periodic non-blocking snapshots using `/usr/bin/nettop`."""
 
     def __init__(self):
         self.last_totals: Dict[int, Tuple[int, int]] = {}
         self.last_time = time.time()
+        self._working_cmd: Optional[List[str]] = None
+
+    def _execute_nettop(self) -> Tuple[int, bytes, bytes]:
+        candidates = [
+            ["/usr/bin/nettop", "-P", "-L", "1", "-J", "bytes_in,bytes_out", "-x"],
+            ["/usr/bin/nettop", "-P", "-L", "1", "-x"],
+            ["/usr/bin/nettop", "-P", "-l", "1", "-J", "bytes_in,bytes_out", "-x"],
+            ["/usr/bin/nettop", "-P", "-L", "1", "-J", "bytes_in,bytes_out"],
+            ["/usr/bin/nettop", "-P", "-L", "1"],
+            ["/usr/bin/nettop", "-P", "-l", "1"],
+        ]
+
+        if self._working_cmd:
+            candidates = [self._working_cmd] + [c for c in candidates if c != self._working_cmd]
+
+        for cmd in candidates:
+            try:
+                res = subprocess.run(cmd, capture_output=True, timeout=5.0)
+                if res.returncode == 0 and res.stdout and len(res.stdout) > 20:
+                    self._working_cmd = cmd
+                    return res.returncode, res.stdout, res.stderr
+            except Exception as e:
+                logger.debug("nettop candidate %s failed: %s", cmd, e)
+
+        return 1, b"", b"All nettop variants failed"
 
     def sample(self) -> List[Tuple[str, int, int, int]]:
         """
@@ -490,18 +597,34 @@ class NetTopSnapshotCollector:
         Returns: list of (comm, pid, rx_delta, tx_delta)
         """
         now = time.time()
-        elapsed = max(0.5, now - self.last_time)
         self.last_time = now
 
-        cmd = ["/usr/bin/nettop", "-P", "-L", "1", "-x"]
-        try:
-            res = subprocess.run(cmd, capture_output=True, timeout=4.0)
-            if res.returncode != 0 or not res.stdout:
-                return []
-            data = plistlib.loads(res.stdout)
-            current_entries = extract_nettop_processes(data)
-        except Exception as e:
-            logger.debug("nettop snapshot error: %s", e)
+        returncode, stdout, stderr = self._execute_nettop()
+        if returncode != 0 or not stdout:
+            if stderr:
+                logger.warning("nettop snapshot error: %s", stderr.decode("utf-8", errors="ignore")[:200])
+            return []
+
+        current_entries: List[Tuple[str, int, int, int]] = []
+
+        # 1. Attempt XML/binary plist decoding if it has plist signatures
+        if stdout.lstrip().startswith(b"<?xml") or stdout.startswith(b"bplist"):
+            try:
+                data = plistlib.loads(stdout)
+                current_entries = extract_nettop_processes(data)
+            except Exception as e:
+                logger.debug("plist parsing error: %s", e)
+
+        # 2. If not plist (or plist returned empty), parse as line-based text/CSV
+        if not current_entries:
+            text = stdout.decode("utf-8", errors="ignore")
+            for line in text.splitlines():
+                parsed = parse_nettop_text_line(line)
+                if parsed:
+                    current_entries.append(parsed)
+
+        if not current_entries:
+            logger.debug("nettop returned output (%d bytes) but 0 entries parsed.", len(stdout))
             return []
 
         deltas = []
