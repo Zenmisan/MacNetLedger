@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 #
 # Builds MacNetLedger.app from Swift sources using swiftc on macOS
+# Generates Universal 2 Binary (x86_64 for Intel MacBook Air 2013 + arm64 for Apple Silicon)
 #
 
 set -euo pipefail
@@ -11,7 +12,7 @@ BUILD_DIR="${SCRIPT_DIR}/../build"
 APP_BUNDLE="${BUILD_DIR}/MacNetLedger.app"
 
 echo "Building MacNetLedger.app..."
-mkdir -p "${BUILD_DIR}"
+mkdir -p "${BUILD_DIR}/bin"
 rm -rf "${APP_BUNDLE}"
 
 # Create .app directory layout
@@ -43,15 +44,60 @@ cat << 'EOF' > "${APP_BUNDLE}/Contents/Info.plist"
 EOF
 
 if command -v swiftc &>/dev/null; then
-    swiftc -O \
-        -sdk "$(xcrun --show-sdk-path 2>/dev/null || echo '')" \
+    SDK_FLAG=()
+    if command -v xcrun &>/dev/null; then
+        SDK_PATH="$(xcrun --show-sdk-path 2>/dev/null || true)"
+        if [[ -n "${SDK_PATH}" ]]; then
+            SDK_FLAG=(-sdk "${SDK_PATH}")
+        fi
+    fi
+
+    # Build Intel x86_64 (MacBook Air 2013 Monterey)
+    echo "Compiling for x86_64 (Intel)..."
+    swiftc -O "${SDK_FLAG[@]}" \
+        -target x86_64-apple-macos12.0 \
         -framework Cocoa \
         -framework SwiftUI \
         -lsqlite3 \
         "${APP_DIR}/LedgerReader.swift" \
         "${APP_DIR}/Views/FlyoutPanel.swift" \
         "${APP_DIR}/AppDelegate.swift" \
-        -o "${APP_BUNDLE}/Contents/MacOS/MacNetLedger"
+        -o "${BUILD_DIR}/bin/MacNetLedger-x86_64" || true
+
+    # Build Apple Silicon arm64
+    echo "Compiling for arm64 (Apple Silicon)..."
+    swiftc -O "${SDK_FLAG[@]}" \
+        -target arm64-apple-macos12.0 \
+        -framework Cocoa \
+        -framework SwiftUI \
+        -lsqlite3 \
+        "${APP_DIR}/LedgerReader.swift" \
+        "${APP_DIR}/Views/FlyoutPanel.swift" \
+        "${APP_DIR}/AppDelegate.swift" \
+        -o "${BUILD_DIR}/bin/MacNetLedger-arm64" || true
+
+    # Create Universal Binary if both exist
+    if [[ -f "${BUILD_DIR}/bin/MacNetLedger-x86_64" ]] && [[ -f "${BUILD_DIR}/bin/MacNetLedger-arm64" ]] && command -v lipo &>/dev/null; then
+        echo "Creating Universal Binary via lipo..."
+        lipo -create -output "${APP_BUNDLE}/Contents/MacOS/MacNetLedger" \
+            "${BUILD_DIR}/bin/MacNetLedger-x86_64" \
+            "${BUILD_DIR}/bin/MacNetLedger-arm64"
+    elif [[ -f "${BUILD_DIR}/bin/MacNetLedger-x86_64" ]]; then
+        cp "${BUILD_DIR}/bin/MacNetLedger-x86_64" "${APP_BUNDLE}/Contents/MacOS/MacNetLedger"
+    elif [[ -f "${BUILD_DIR}/bin/MacNetLedger-arm64" ]]; then
+        cp "${BUILD_DIR}/bin/MacNetLedger-arm64" "${APP_BUNDLE}/Contents/MacOS/MacNetLedger"
+    else
+        # Direct native compile fallback
+        swiftc -O "${SDK_FLAG[@]}" \
+            -framework Cocoa \
+            -framework SwiftUI \
+            -lsqlite3 \
+            "${APP_DIR}/LedgerReader.swift" \
+            "${APP_DIR}/Views/FlyoutPanel.swift" \
+            "${APP_DIR}/AppDelegate.swift" \
+            -o "${APP_BUNDLE}/Contents/MacOS/MacNetLedger"
+    fi
+
     echo "✓ Built successfully: ${APP_BUNDLE}"
 else
     echo "Note: swiftc is not present in the current environment (Linux)."
