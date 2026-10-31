@@ -632,6 +632,7 @@ class NetTopSnapshotCollector:
 
         deltas = []
         current_pids = set()
+        is_first_sample = (len(self.last_totals) == 0)
 
         for comm, pid, rx_total, tx_total in current_entries:
             current_pids.add(pid)
@@ -640,8 +641,12 @@ class NetTopSnapshotCollector:
                 rx_delta = max(0, rx_total - prev_rx)
                 tx_delta = max(0, tx_total - prev_tx)
             else:
-                rx_delta = 0
-                tx_delta = 0
+                if is_first_sample and (rx_total > 0 or tx_total > 0):
+                    rx_delta = rx_total
+                    tx_delta = tx_total
+                else:
+                    rx_delta = 0
+                    tx_delta = 0
 
             self.last_totals[pid] = (rx_total, tx_total)
             deltas.append((comm, pid, rx_delta, tx_delta))
@@ -689,6 +694,7 @@ def main():
 
     last_prune_time = time.time()
     pending_deltas: Dict[Tuple[int, str, str, str, str, str, int], Tuple[int, int]] = {}
+    is_first_tick = True
 
     while running:
         tick_start = time.time()
@@ -711,12 +717,18 @@ def main():
                 prev_rx, prev_tx = pending_deltas.get(key, (0, 0))
                 pending_deltas[key] = (prev_rx + rx_bytes, prev_tx + tx_bytes)
 
-                rx_rate = rx_bytes / args.interval
-                tx_rate = tx_bytes / args.interval
+                if is_first_tick:
+                    rx_rate = 0.0
+                    tx_rate = 0.0
+                else:
+                    rx_rate = rx_bytes / args.interval
+                    tx_rate = tx_bytes / args.interval
                 current_tick_records.append((pid, root_group, category, child_comm, child_detail, rx_rate, tx_rate))
 
-                if is_hotspot:
+                if is_hotspot and not is_first_tick:
                     tick_hotspot_bytes += (rx_bytes + tx_bytes)
+
+            is_first_tick = False
 
             if pending_deltas:
                 storage.record_deltas(pending_deltas)

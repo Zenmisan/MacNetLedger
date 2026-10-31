@@ -60,6 +60,7 @@ chmod -R 0777 "/Library/Application Support/MacNetLedger"
 # Register and start launchd daemon
 launchctl unload /Library/LaunchDaemons/dev.zenmi.macnetledgerd.plist 2>/dev/null || true
 launchctl load -w /Library/LaunchDaemons/dev.zenmi.macnetledgerd.plist
+launchctl kickstart -k -p system/dev.zenmi.macnetledgerd 2>/dev/null || true
 
 # Give the daemon 1 second to create/verify initial SQLite tables and re-apply full permissions
 sleep 1
@@ -86,7 +87,7 @@ if command -v pkgbuild &>/dev/null; then
         --root "${PKG_ROOT}" \
         --scripts "${SCRIPTS_DIR}" \
         --identifier "dev.zenmi.MacNetLedger" \
-        --version "1.0.7" \
+        --version "1.0.8" \
         --install-location "/" \
         "${OUTPUT_PKG}"
     echo "[3/3] Package generated successfully:"
