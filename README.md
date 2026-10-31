@@ -96,10 +96,12 @@ MacNetLedger/
 │   │   ├── Views/                    # Menu pill & inspector views
 │   │   └── Models/                   # SQLite query & data structures
 ├── scripts/
-│   ├── install.sh                    # Setup daemon & directory permissions
-│   └── uninstall.sh                  # Clean daemon and database teardown
+│   ├── install.sh                    # Setup daemon & directory permissions (sudo)
+│   ├── uninstall.sh                  # Clean daemon and database teardown (sudo)
+│   └── build_app.sh                  # Builds native MacNetLedger.app via swiftc
 ├── tests/
 │   ├── test_lineage.py               # Process lineage unit tests
+│   ├── test_nettop_parser.py         # nettop CSV stream parser tests
 │   └── test_storage.py               # SQLite rollup and schema tests
 ├── Makefile                          # Build and testing targets
 └── README.md                         # Project documentation
@@ -109,34 +111,52 @@ MacNetLedger/
 
 ## Installation & Quickstart (macOS 12.7+)
 
-### 1. Automated Installation
-Clone the repository to your Mac and run the installer:
+### 1. Install & Activate Background Daemon
+Run the setup script with administrative privileges to install the daemon and configure `launchd`:
 ```bash
-git clone https://github.com/zenmisan/MacNetLedger.git
-cd MacNetLedger
-chmod +x scripts/install.sh
+chmod +x scripts/*.sh
 sudo ./scripts/install.sh
 ```
 
 The installer will:
-1. Provision `/Library/Application Support/MacNetLedger/` with `0755` permissions.
+1. Provision `/Library/Application Support/MacNetLedger/` with `0777` directory permissions (allowing unprivileged UI access to SQLite WAL).
 2. Install `macnetledgerd` into `/usr/local/bin/macnetledgerd`.
-3. Register and start the `launchd` daemon at `/Library/LaunchDaemons/dev.zenmi.macnetledgerd.plist`.
+3. Register and start the `launchd` service at `/Library/LaunchDaemons/dev.zenmi.macnetledgerd.plist`.
 
 ### 2. Verify Daemon Status
-Check if the daemon is actively recording:
+Verify that `launchd` is running the collector:
 ```bash
 sudo launchctl list | grep dev.zenmi.macnetledgerd
 ```
-Inspect current live rates from the SQLite ledger:
+
+Inspect current live rates directly from the SQLite ledger:
 ```bash
 sqlite3 -header -column "/Library/Application Support/MacNetLedger/ledger.db" "SELECT * FROM live_summary;"
 ```
 
-### 3. Launch the Menu Bar App
-Open the companion app:
+### 3. Build & Launch the Menu Bar App
+Compile the native Swift menu bar application using `swiftc` (no heavy Xcode IDE required):
 ```bash
+./scripts/build_app.sh
+```
+
+Optionally move it to `/Applications/` and open it:
+```bash
+cp -r build/MacNetLedger.app /Applications/
 open /Applications/MacNetLedger.app
+```
+
+---
+
+## Uninstallation
+
+To remove the background daemon and clean up:
+```bash
+# Keep database:
+sudo ./scripts/uninstall.sh
+
+# Or completely purge database & logs:
+sudo ./scripts/uninstall.sh --purge-data
 ```
 
 ---
