@@ -111,7 +111,23 @@ MacNetLedger/
 
 ## Installation & Quickstart (macOS 12.7+)
 
-### 1. Install & Activate Background Daemon
+### Option A: 1-Click GUI Installer (.pkg)
+For users who do not want to touch terminal or build from source:
+1. Download **`MacNetLedger-Installer.pkg`** from the [GitHub Releases](https://github.com/Zenmisan/MacNetLedger/releases).
+2. Double-click the installer and follow the standard macOS setup wizard.
+3. The installer automatically provisions the background daemon, registers `launchd`, installs the app to `/Applications`, and starts MacNetLedger in your Menu Bar.
+
+---
+
+### Option B: 1-Line Terminal Install (No Git Clone Required)
+Open Terminal and run:
+```bash
+curl -fsSL https://raw.githubusercontent.com/Zenmisan/MacNetLedger/main/scripts/get.sh | bash
+```
+
+---
+
+### Option C: Developer Manual Build from Source
 Run the setup script with administrative privileges to install the daemon and configure `launchd`:
 ```bash
 chmod +x scripts/*.sh
