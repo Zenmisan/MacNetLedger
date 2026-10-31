@@ -81,6 +81,52 @@ class TestNettopParsers(unittest.TestCase):
         self.assertEqual(len(res), 1)
         self.assertEqual(res[0], ("Safari", 120, 40000, 8000))
 
+    def test_parse_netstat_link_line(self):
+        from daemon.macnetledgerd import parse_netstat_link_line
+
+        line_en0 = "en0   1500  <Link#4>    38:f9:d3:01:23:45  450000     0  350000000   280000     0   45000000     0"
+        parsed_en0 = parse_netstat_link_line(line_en0)
+        self.assertIsNotNone(parsed_en0)
+        iface, rx, tx = parsed_en0
+        self.assertEqual(iface, "en0")
+        self.assertEqual(rx, 350000000)
+        self.assertEqual(tx, 45000000)
+
+        line_lo0 = "lo0   16384 <Link#1>                         1200     0     150000     1200     0     150000     0"
+        parsed_lo0 = parse_netstat_link_line(line_lo0)
+        self.assertIsNotNone(parsed_lo0)
+        self.assertEqual(parsed_lo0, ("lo0", 150000, 150000))
+
+        # Non-link line should return None
+        line_inet = "en0   1500  192.168.1     192.168.1.100      450000     -  350000000   280000     -   45000000     -"
+        self.assertIsNone(parse_netstat_link_line(line_inet))
+
+    def test_collector_credits_runtime_spawned_pids(self):
+        from daemon.macnetledgerd import NetTopSnapshotCollector
+        from unittest.mock import patch
+
+        collector = NetTopSnapshotCollector()
+
+        # Tick 1 (Boot baseline): Spotify is already running with 50,000 bytes
+        mock_stdout_tick1 = b"Spotify.500,50000,10000,\n"
+        with patch.object(collector, "_execute_nettop", return_value=(0, mock_stdout_tick1, b"")):
+            deltas = collector.sample()
+            self.assertEqual(len(deltas), 1)
+            comm, pid, rx_delta, tx_delta = deltas[0]
+            # Boot baseline must have 0 delta so pre-boot data isn't counted as a spike
+            self.assertEqual(rx_delta, 0)
+            self.assertEqual(tx_delta, 0)
+
+        # Tick 2 (Runtime): Chrome Helper spawns and downloads 5 MB
+        mock_stdout_tick2 = b"Spotify.500,50500,10100,\nGoogle Chrome H.789,5242880,10240,\n"
+        with patch.object(collector, "_execute_nettop", return_value=(0, mock_stdout_tick2, b"")):
+            deltas = collector.sample()
+            delta_dict = {d[1]: (d[0], d[2], d[3]) for d in deltas}
+            # Spotify delta should be 500 rx, 100 tx
+            self.assertEqual(delta_dict[500], ("Spotify", 500, 100))
+            # Chrome Helper (spawned at runtime) MUST be credited with full 5 MB!
+            self.assertEqual(delta_dict[789], ("Google Chrome H", 5242880, 10240))
+
 
 if __name__ == "__main__":
     unittest.main()

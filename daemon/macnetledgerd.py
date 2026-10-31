@@ -159,6 +159,20 @@ def parse_nettop_text_line(line: str) -> Optional[Tuple[str, int, int, int]]:
     return (comm.strip(), pid, rx_val, tx_val)
 
 
+def parse_netstat_link_line(line: str) -> Optional[Tuple[str, int, int]]:
+    """Parses a `<Link...>` interface line from BSD `netstat -ib -n`. Returns (iface, rx_bytes, tx_bytes) or None."""
+    parts = line.split()
+    if len(parts) >= 7 and "<Link" in line:
+        try:
+            iface = parts[0]
+            rx_bytes = int(parts[-5])
+            tx_bytes = int(parts[-2])
+            return iface, rx_bytes, tx_bytes
+        except (ValueError, IndexError):
+            return None
+    return None
+
+
 def extract_nettop_processes(data) -> List[Tuple[str, int, int, int]]:
     """Extracts (comm, pid, bytes_in, bytes_out) from parsed nettop XML plist."""
     entries = []
@@ -531,6 +545,18 @@ class MacLedgerStorage:
         self.conn.commit()
         return current_today
 
+    def get_hotspot_today_bytes(self) -> int:
+        cur = self.conn.cursor()
+        today_iso = datetime.date.today().isoformat()
+        cur.execute("SELECT today_bytes, last_reset_day FROM hotspot_budget WHERE id = 1;")
+        row = cur.fetchone()
+        if not row:
+            return 0
+        today_bytes, last_reset = row
+        if last_reset != today_iso:
+            return 0
+        return today_bytes
+
     def prune_and_rollup(self):
         cur = self.conn.cursor()
         now = int(time.time())
@@ -564,35 +590,112 @@ class MacLedgerStorage:
         self._ensure_file_permissions()
 
 
+class HardwareInterfaceRateMeter:
+    """Reads hardware network interface byte counters via /usr/sbin/netstat -ib in ~3ms."""
+
+    def __init__(self):
+        self.last_rx = 0
+        self.last_tx = 0
+        self.last_time = 0.0
+        self.default_interface = "en0"
+        self._last_iface_check = 0.0
+
+    def get_active_interface(self) -> str:
+        now = time.time()
+        if now - self._last_iface_check < 10.0 and self.default_interface:
+            return self.default_interface
+
+        if sys.platform == "darwin":
+            try:
+                res = subprocess.run(["route", "-n", "get", "default"], capture_output=True, text=True, timeout=1.0)
+                for line in res.stdout.splitlines():
+                    line = line.strip()
+                    if line.startswith("interface:"):
+                        self.default_interface = line.split(":", 1)[1].strip()
+                        self._last_iface_check = now
+                        return self.default_interface
+            except Exception:
+                pass
+        self._last_iface_check = now
+        return self.default_interface or "en0"
+
+    def sample(self) -> Tuple[int, int, float, float]:
+        """
+        Samples hardware interface byte counters.
+        Returns: (rx_delta, tx_delta, rx_rate, tx_rate)
+        """
+        now = time.time()
+        dt = max(0.1, now - self.last_time) if self.last_time > 0 else 1.0
+
+        if sys.platform != "darwin":
+            self.last_time = now
+            return (0, 0, 0.0, 0.0)
+
+        iface = self.get_active_interface()
+        rx_total = 0
+        tx_total = 0
+
+        try:
+            res = subprocess.run(["/usr/sbin/netstat", "-ib", "-n", "-I", iface], capture_output=True, text=True, timeout=1.0)
+            if res.returncode == 0:
+                for line in res.stdout.splitlines():
+                    parsed = parse_netstat_link_line(line)
+                    if parsed:
+                        _, rx_total, tx_total = parsed
+                        break
+        except Exception as e:
+            logger.debug("netstat -I %s failed: %s", iface, e)
+
+        if rx_total == 0 and tx_total == 0:
+            try:
+                res = subprocess.run(["/usr/sbin/netstat", "-ib", "-n"], capture_output=True, text=True, timeout=1.0)
+                for line in res.stdout.splitlines():
+                    parsed = parse_netstat_link_line(line)
+                    if parsed and parsed[0] == iface:
+                        _, rx_total, tx_total = parsed
+                        break
+            except Exception:
+                pass
+
+        if self.last_time == 0.0:
+            # Baseline boot snapshot
+            self.last_rx = rx_total
+            self.last_tx = tx_total
+            self.last_time = now
+            return (0, 0, 0.0, 0.0)
+
+        rx_delta = max(0, rx_total - self.last_rx)
+        tx_delta = max(0, tx_total - self.last_tx)
+        self.last_rx = rx_total
+        self.last_tx = tx_total
+        self.last_time = now
+
+        rx_rate = rx_delta / dt
+        tx_rate = tx_delta / dt
+        return (rx_delta, tx_delta, rx_rate, tx_rate)
+
+
 class NetTopSnapshotCollector:
     """Takes periodic non-blocking snapshots using `/usr/bin/nettop`."""
 
     def __init__(self):
         self.last_totals: Dict[int, Tuple[int, int]] = {}
         self.last_time = time.time()
-        self._working_cmd: Optional[List[str]] = ["/usr/bin/nettop", "-P", "-L", "1", "-J", "bytes_in,bytes_out"]
+        self.is_boot = True
+        self._cmd = ["/usr/bin/nettop", "-P", "-L", "1", "-J", "bytes_in,bytes_out"]
 
     def _execute_nettop(self) -> Tuple[int, bytes, bytes]:
-        candidates = [
-            ["/usr/bin/nettop", "-P", "-L", "1", "-J", "bytes_in,bytes_out"],
-            ["/usr/bin/nettop", "-P", "-l", "1", "-J", "bytes_in,bytes_out"],
-            ["/usr/bin/nettop", "-P", "-L", "1"],
-            ["/usr/bin/nettop", "-P", "-l", "1"],
-        ]
+        try:
+            res = subprocess.run(self._cmd, capture_output=True, timeout=2.5)
+            if res.returncode == 0 and res.stdout and len(res.stdout) > 20:
+                return res.returncode, res.stdout, res.stderr
+        except subprocess.TimeoutExpired:
+            logger.warning("nettop timed out (2.5s), skipping snapshot this tick")
+            return 1, b"", b"timeout"
+        except Exception as e:
+            logger.debug("nettop candidate %s failed: %s", self._cmd, e)
 
-        if self._working_cmd:
-            candidates = [self._working_cmd] + [c for c in candidates if c != self._working_cmd]
-
-        for cmd in candidates:
-            try:
-                res = subprocess.run(cmd, capture_output=True, timeout=2.0)
-                if res.returncode == 0 and res.stdout and len(res.stdout) > 20:
-                    self._working_cmd = cmd
-                    return res.returncode, res.stdout, res.stderr
-            except Exception as e:
-                logger.debug("nettop candidate %s failed: %s", cmd, e)
-
-        return 1, b"", b"All nettop variants failed"
+        return 1, b"", b"nettop failed"
 
     def sample(self) -> List[Tuple[str, int, int, int]]:
         """
@@ -604,7 +707,7 @@ class NetTopSnapshotCollector:
 
         returncode, stdout, stderr = self._execute_nettop()
         if returncode != 0 or not stdout:
-            if stderr:
+            if stderr and stderr != b"timeout":
                 logger.warning("nettop snapshot error: %s", stderr.decode("utf-8", errors="ignore")[:200])
             return []
 
@@ -632,7 +735,6 @@ class NetTopSnapshotCollector:
 
         deltas = []
         current_pids = set()
-        is_first_sample = (len(self.last_totals) == 0)
 
         for comm, pid, rx_total, tx_total in current_entries:
             current_pids.add(pid)
@@ -641,15 +743,20 @@ class NetTopSnapshotCollector:
                 rx_delta = max(0, rx_total - prev_rx)
                 tx_delta = max(0, tx_total - prev_tx)
             else:
-                if is_first_sample and (rx_total > 0 or tx_total > 0):
-                    rx_delta = rx_total
-                    tx_delta = tx_total
-                else:
+                if self.is_boot:
+                    # Boot baseline: establish starting totals without attributing past usage
                     rx_delta = 0
                     tx_delta = 0
+                else:
+                    # RUNTIME SPAWN: This PID was created while MacNetLedger was actively running!
+                    # Credit all its accumulated bytes (short-lived helper, curl, git, media download).
+                    rx_delta = rx_total
+                    tx_delta = tx_total
 
             self.last_totals[pid] = (rx_total, tx_total)
             deltas.append((comm, pid, rx_delta, tx_delta))
+
+        self.is_boot = False
 
         # Evict terminated PIDs from cache
         for old_pid in list(self.last_totals.keys()):
@@ -680,6 +787,7 @@ def main():
     storage = MacLedgerStorage(args.db)
     resolver = DarwinProcessResolver()
     net_detector = NetworkStateDetector()
+    hw_meter = HardwareInterfaceRateMeter()
     collector = NetTopSnapshotCollector()
 
     running = True
@@ -699,12 +807,17 @@ def main():
     while running:
         tick_start = time.time()
         try:
+            # 1. Sample hardware interface counters (takes 2-3ms)
+            hw_rx_delta, hw_tx_delta, hw_rx_rate, hw_tx_rate = hw_meter.sample()
+
+            # 2. Sample per-process breakdown via nettop
             deltas = collector.sample()
             now = time.time()
 
             network_name, is_hotspot = net_detector.get_network_state()
             current_tick_records = []
-            tick_hotspot_bytes = 0
+            tick_proc_rx_sum = 0
+            tick_proc_tx_sum = 0
 
             for comm, pid, rx_bytes, tx_bytes in deltas:
                 if rx_bytes == 0 and tx_bytes == 0:
@@ -717,29 +830,54 @@ def main():
                 prev_rx, prev_tx = pending_deltas.get(key, (0, 0))
                 pending_deltas[key] = (prev_rx + rx_bytes, prev_tx + tx_bytes)
 
-                if is_first_tick:
-                    rx_rate = 0.0
-                    tx_rate = 0.0
-                else:
-                    rx_rate = rx_bytes / args.interval
-                    tx_rate = tx_bytes / args.interval
+                rx_rate = rx_bytes / float(args.interval)
+                tx_rate = tx_bytes / float(args.interval)
                 current_tick_records.append((pid, root_group, category, child_comm, child_detail, rx_rate, tx_rate))
 
-                if is_hotspot and not is_first_tick:
-                    tick_hotspot_bytes += (rx_bytes + tx_bytes)
+                tick_proc_rx_sum += rx_bytes
+                tick_proc_tx_sum += tx_bytes
 
-            is_first_tick = False
+            # 3. Hardware Reconciliation: If hardware saw more bytes than nettop captured,
+            # attribute the unattributed bytes to "macOS System / Kernel"
+            unattributed_rx = max(0, hw_rx_delta - tick_proc_rx_sum)
+            unattributed_tx = max(0, hw_tx_delta - tick_proc_tx_sum)
 
-            if pending_deltas:
+            if (unattributed_rx > 1024 or unattributed_tx > 1024) and not is_first_tick:
+                kernel_group = "macOS System / Kernel"
+                kernel_cat = "System"
+                kernel_comm = "kernel_task"
+                kernel_detail = "Kernel Network Stack"
+                bucket_ts = (int(now) // 300) * 300
+                k_key = (bucket_ts, kernel_group, kernel_cat, kernel_comm, kernel_detail, network_name, 1 if is_hotspot else 0)
+
+                prev_rx, prev_tx = pending_deltas.get(k_key, (0, 0))
+                pending_deltas[k_key] = (prev_rx + unattributed_rx, prev_tx + unattributed_tx)
+
+                k_rx_rate = unattributed_rx / float(args.interval)
+                k_tx_rate = unattributed_tx / float(args.interval)
+                current_tick_records.append((0, kernel_group, kernel_cat, kernel_comm, kernel_detail, k_rx_rate, k_tx_rate))
+
+            # 4. Total rates and Hotspot accounting
+            proc_rx_rate = sum(r[5] for r in current_tick_records)
+            proc_tx_rate = sum(r[6] for r in current_tick_records)
+            total_rx_rate = max(hw_rx_rate, proc_rx_rate)
+            total_tx_rate = max(hw_tx_rate, proc_tx_rate)
+
+            total_tick_bytes = max(hw_rx_delta + hw_tx_delta, tick_proc_rx_sum + tick_proc_tx_sum + unattributed_rx + unattributed_tx)
+
+            if pending_deltas and not is_first_tick:
                 storage.record_deltas(pending_deltas)
+                pending_deltas.clear()
+            elif is_first_tick:
                 pending_deltas.clear()
 
             hotspot_today = 0
-            if tick_hotspot_bytes > 0:
-                hotspot_today = storage.update_hotspot_budget(tick_hotspot_bytes)
+            if is_hotspot and total_tick_bytes > 0 and not is_first_tick:
+                hotspot_today = storage.update_hotspot_budget(total_tick_bytes)
+            elif is_hotspot:
+                hotspot_today = storage.get_hotspot_today_bytes()
 
-            total_rx_rate = sum(r[5] for r in current_tick_records)
-            total_tx_rate = sum(r[6] for r in current_tick_records)
+            is_first_tick = False
 
             top_process = ""
             top_category = ""
@@ -768,7 +906,7 @@ def main():
 
         # Sleep remaining time to maintain consistent interval
         elapsed = time.time() - tick_start
-        sleep_time = max(0.2, float(args.interval) - elapsed)
+        sleep_time = max(0.1, float(args.interval) - elapsed)
         time.sleep(sleep_time)
 
     logger.info("MacNetLedger Daemon stopped cleanly.")
